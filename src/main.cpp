@@ -186,10 +186,30 @@ constexpr uint8_t OLED_HEIGHT = 32;
 // 400 kHz there is not, and the controller receives corrupted commands.
 constexpr uint32_t I2C_CLOCK_HZ = 100000UL;
 
-// Text layout for the test screen, inset far enough to clear the border.
+// Text layout, inset far enough to clear the border.
 constexpr int16_t OLED_TEXT_LEFT = 4;
 constexpr int16_t OLED_TEXT_TOP = 4;
 constexpr int16_t OLED_LINE_SPACING = 9;
+
+// What the screen says. Three lines is what fits, and inside the border each
+// holds 20 characters at this font: 128 pixels wide, six to a character cell,
+// less the inset at both ends.
+//
+// The screen carries what is worth reading while the rover is standing still,
+// before a run: where to connect, and whether the connection came up. Nothing
+// that changes while it drives is here. A 0.91 inch panel cannot be read from
+// across a room by someone following a moving vehicle, the dashboard already
+// shows every live reading on a screen that is in the operator's hand, and the
+// brake light and buzzer already announce the AEB stage from a distance.
+//
+// The third line answers a question nothing else could. When the page fails to
+// load there was no way to tell a phone problem from a network problem from a
+// server problem; a line saying whether anything is associated separates them
+// at a glance.
+constexpr char SCREEN_TITLE[] = "SafeRover";
+constexpr char SCREEN_PHONE_YES[] = "phone: connected";
+constexpr char SCREEN_PHONE_NO[] = "phone: waiting";
+constexpr char SCREEN_AP_FAILED[] = "WIFI AP FAILED";
 
 // -1 says there is no reset pin: this module has four pins and exposes none.
 constexpr int8_t OLED_RESET_PIN = -1;
@@ -254,6 +274,12 @@ constexpr uint32_t PWM_MAX_DUTY =
 
 // --- Timing ---
 constexpr unsigned long LINE_PRINT_INTERVAL_MS = 200;
+
+// How often the screen is asked whether anything it shows has changed. The ask
+// is cheap - a station count out of an internal table - and it is the redraw
+// that is expensive, so this rate costs almost nothing and the screen still
+// follows a phone connecting within half a second.
+constexpr unsigned long DISPLAY_CHECK_INTERVAL_MS = 500;
 
 // Halved from 100 along with the AEB thresholds: at 84.4 cm/s the rover covers
 // about 4.2 cm between reads instead of 8.4.
@@ -579,6 +605,24 @@ unsigned long lastButtonChange = 0;
 unsigned long lastLinePrint = 0;
 unsigned long lastDistanceRead = 0;
 unsigned long lastWebHandle = 0;
+unsigned long lastDisplayCheck = 0;
+
+// Both of these are answers setup() already had and used to throw away.
+//
+// displayReady is the one that matters. Until now the only drawing happened
+// inside the branch where begin() had succeeded, so nothing could reach the
+// panel after a failed one. A screen the loop redraws changes that: begin()
+// returns false when the framebuffer could not be allocated, and drawPixel
+// indexes that buffer with no null test, so drawing after a failed allocation
+// would write through a null pointer.
+bool displayReady = false;
+bool apUp = false;
+
+// What the last redraw was drawn from. Starts at a value no real count can
+// take, so the first check always draws rather than depending on the screen
+// happening to differ from zero.
+constexpr uint8_t DISPLAY_STATIONS_UNKNOWN = 0xFF;
+uint8_t lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
 
 // The last readings the loop took, held at file scope so a request handler can
 // report them without measuring anything itself.
@@ -1005,42 +1049,64 @@ static void confirmWarnStage() {
   }
 }
 
-// Draws the one-off screen that proves the panel works and that the configured
-// resolution matches the physical one.
+// Draws the status screen. Replaces the phase 2 test screen, which had proved
+// what it was built to prove twice over - once under finger pressure while the
+// first panel was failing, and once on the vehicle with the replacement. This
+// screen renders at boot, so it is a standing proof of life in its own right.
+// Why that screen carried a border as a resolution check is in the journal,
+// session 10.
 //
-// Every call below writes into a pixel buffer held in the ESP32's own RAM —
-// nothing reaches the panel until display() pushes that whole buffer out over
-// I2C. display() is therefore the expensive operation, and the only one whose
-// cost scales with the bus rather than the CPU. In the finished firmware it
-// gets called when the content actually changes, never once per loop pass.
-static void showTestScreen() {
+// Every call below writes into a pixel buffer in the ESP32's own RAM. Nothing
+// reaches the panel until display() pushes that whole buffer out over I2C, so
+// display() is the expensive operation and the only one whose cost scales with
+// the bus rather than the CPU. It is called when the content changes, never
+// once per loop pass.
+static void showStatusScreen(uint8_t stations) {
   display.clearDisplay();
 
   constexpr uint16_t FOREGROUND = SSD1306_WHITE;
 
-  // The border is the resolution test. It sits on the outermost pixels on all
-  // four sides, so if the panel is really a different size the frame will not
-  // line up with its physical edges — cropped, or floating short of them. Text
-  // alone would still look plausible on a wrongly sized buffer.
   display.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, FOREGROUND);
 
   display.setTextSize(1);
   display.setTextColor(FOREGROUND);
 
   display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP);
-  display.print("SafeRover");
+  display.print(SCREEN_TITLE);
 
   display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP + OLED_LINE_SPACING);
-  display.print("phase 2 - bench");
 
-  // The configured resolution is printed as well as drawn. If the border looks
-  // wrong, this says what the firmware believed the panel was.
-  display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP + 2 * OLED_LINE_SPACING);
-  display.print(OLED_WIDTH);
-  display.print("x");
-  display.print(OLED_HEIGHT);
+  if (apUp) {
+    display.print(WiFi.softAPIP());
+
+    // Only meaningful while there is a network for something to be associated
+    // to, so it is left off entirely rather than printed as a no.
+    display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP + 2 * OLED_LINE_SPACING);
+    display.print(stations > 0 ? SCREEN_PHONE_YES : SCREEN_PHONE_NO);
+  } else {
+    display.print(SCREEN_AP_FAILED);
+  }
 
   display.display();
+}
+
+// Redraws only when what the screen says has actually changed. The address is
+// fixed once setup() is over and the failure line cannot change at all, so the
+// station count is the only thing left that moves.
+static void updateStatusScreen() {
+  // A failed begin() means there is no buffer to draw into. Reported at boot
+  // and then left alone: the rover drives perfectly well without a screen.
+  if (!displayReady) {
+    return;
+  }
+
+  const uint8_t stations = WiFi.softAPgetStationNum();
+  if (stations == lastDrawnStations) {
+    return;
+  }
+
+  lastDrawnStations = stations;
+  showStatusScreen(stations);
 }
 
 // Brings up the access point and reports where to find it. Nothing here waits:
@@ -1055,13 +1121,15 @@ static void startAccessPoint() {
   // network to join yet and would spend its time scanning for one.
   WiFi.mode(WIFI_AP);
 
-  const bool started =
-      WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL,
-                  WIFI_AP_HIDDEN, WIFI_AP_MAX_CLIENTS);
+  // Kept rather than only reported. The screen has to be able to say whether
+  // the network came up, and after setup() returns there is nothing else left
+  // in the firmware that knows.
+  apUp = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL,
+                     WIFI_AP_HIDDEN, WIFI_AP_MAX_CLIENTS);
 
   // Deliberately behind no log switch. These print once at boot, and the
   // address is the only way to know what to point a browser at.
-  if (!started) {
+  if (!apUp) {
     // Reported and then let go, the same as the display above: a rover that
     // stops dead because a radio did not come up is worse than one that still
     // drives without it.
@@ -1356,9 +1424,16 @@ void setup() {
   // anyway, because drawPixel indexes the buffer with no null check, so
   // drawing after a failed allocation writes through a null pointer.
   // Reported and then let go: the rover runs on without its screen.
-  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false)) {
-    showTestScreen();
-  } else {
+  //
+  // The result is kept now that the loop draws too, because every draw has to
+  // be able to ask whether there is a buffer to draw into.
+  //
+  // Nothing is drawn here. The first screen wants to say whether the access
+  // point came up, and that is not known until startAccessPoint() below has
+  // run; the loop puts it up on its first pass either way.
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false);
+
+  if (!displayReady) {
     Serial.println("OLED buffer allocation FAILED - out of RAM");
   }
 
@@ -1395,6 +1470,16 @@ void setup() {
 
 void loop() {
   const unsigned long now = millis();
+
+  // Asks whether the screen is out of date, which is cheap, and redraws only if
+  // it is, which is not. First in the loop on purpose: on the rare pass where
+  // it does redraw it blocks for tens of milliseconds, and putting it here
+  // means the distance reading taken afterwards is the fresher one rather than
+  // the one left waiting behind it.
+  if (now - lastDisplayCheck >= DISPLAY_CHECK_INTERVAL_MS) {
+    lastDisplayCheck = now;
+    updateStatusScreen();
+  }
 
   // Report transitions only, and only once the debounce window has passed. The
   // metal contacts bounce for a few milliseconds on every open and close, which
