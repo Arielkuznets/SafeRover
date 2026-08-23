@@ -660,7 +660,8 @@ unsigned long lastCommandMs = 0;
 bool commandTimedOut = true;
 
 // Starts Clear because nothing has been measured yet, not because the road is
-// known to be empty. The first reading, 100 ms in, replaces it.
+// known to be empty. The first reading replaces it, one
+// DISTANCE_READ_INTERVAL_MS into the loop.
 AebStage aebStage = AebStage::Clear;
 uint8_t aebMissedReads = 0;
 uint8_t aebWarnReads = 0;
@@ -988,7 +989,7 @@ static void updateAebStage() {
       aebStage = byDistance;
     } else {
       // Leaving takes one stage per reading, and only past the exit threshold,
-      // so backing away from a wall takes about 300 ms to reach Clear.
+      // so backing away from a wall takes three readings to reach Clear.
       switch (aebStage) {
       case AebStage::Stop:
         if (distanceCm > AEB_STOP_EXIT_CM) {
