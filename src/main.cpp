@@ -244,6 +244,12 @@ constexpr unsigned long SAMPLE_SPACING_MS = 5;
 // whole 0-3.3 V the sensor can put out is measurable.
 constexpr uint8_t ADC_RESOLUTION_BITS = 12;
 
+// Derived from the resolution so the two cannot drift apart, the same way
+// PWM_MAX_DUTY is derived below. This is what a running minimum starts from: a
+// minimum has to begin above every value it could ever meet, and this is the
+// highest reading the ADC can produce.
+constexpr uint16_t ADC_MAX_VALUE = (1U << ADC_RESOLUTION_BITS) - 1;
+
 // The ADC is noisy: repeated reads of a steady voltage still differ by tens of
 // counts. Averaging a burst of samples narrows that spread.
 constexpr uint8_t LINE_SENSOR_SAMPLES = 16;
@@ -273,7 +279,21 @@ constexpr uint32_t PWM_MAX_DUTY =
     (1UL << PWM_RESOLUTION_BITS) - 1; // UL unsigned long
 
 // --- Timing ---
-constexpr unsigned long LINE_PRINT_INTERVAL_MS = 200;
+// The resting rate the line sensors are read at, and the one the loop returns
+// to. Named READ rather than PRINT because the two are no longer the same
+// thing: the reading runs on this clock, the reporting on one of its own
+// below. They were a single rate until the calibration needed a fast read
+// without a fast print.
+constexpr unsigned long LINE_READ_INTERVAL_MS = 200;
+
+// How often the accumulated span and timing are reported.
+//
+// Deliberately far slower than the read. At the calibration rate the read block
+// runs a hundred times a second, and a line per read would not merely flood the
+// terminal: Serial.print blocks once the transmit buffer fills, so the
+// reporting would stretch the very interval it exists to measure. An instrument
+// that disturbs what it measures is worth nothing.
+constexpr unsigned long LINE_SUMMARY_INTERVAL_MS = 500;
 
 // How often the screen is asked whether anything it shows has changed. The ask
 // is cheap - a station count out of an internal table - and it is the redraw
@@ -320,7 +340,9 @@ constexpr unsigned long SERIAL_BAUD = 115200;
 // rejected command, the watchdog firing, a failed init, the addresses reported
 // at boot. Those are not reports that repeat, they are things that happened.
 constexpr bool LOG_BUTTON = false;
-constexpr bool LOG_LINE = false;
+// On for the calibration work: the line summary is the entire output of this
+// stage, which measures rather than acts.
+constexpr bool LOG_LINE = true;
 constexpr bool LOG_DISTANCE = false;
 constexpr bool LOG_DRIVE = true;
 
@@ -602,7 +624,15 @@ enum class StopMode : uint8_t { Coast, Brake };
 bool lastButtonPressed = false;
 unsigned long lastButtonChange = 0;
 
-unsigned long lastLinePrint = 0;
+unsigned long lastLineRead = 0;
+unsigned long lastLineSummary = 0;
+
+// The rate the line sensors are actually being read at right now. A variable
+// rather than a constant because the calibration raises it for the few seconds
+// it runs and then puts it back; LINE_READ_INTERVAL_MS is the value it is put
+// back to, so the resting rate is never written as a bare number.
+unsigned long lineReadIntervalMs = LINE_READ_INTERVAL_MS;
+
 unsigned long lastDistanceRead = 0;
 unsigned long lastWebHandle = 0;
 unsigned long lastDisplayCheck = 0;
@@ -640,6 +670,38 @@ uint8_t lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
 uint16_t lineLeftValue = 0;
 uint16_t lineRightValue = 0;
 unsigned long echoDurationValue = 0;
+
+// The span each line sensor has seen since boot, and the timing the loop
+// actually achieved while collecting it.
+//
+// Kept per sensor rather than as one shared pair. The two read a few hundred
+// counts apart over the same surface, and more to the point a shared span would
+// let a sensor that reached a stripe cover for one that never did - which is
+// exactly the silent failure the calibration has to be able to refuse.
+//
+// The minimums start at the top of the ADC range and the maximums at the
+// bottom, so the first reading of each replaces the seed rather than competing
+// with it. Seeding a minimum at zero would leave it at zero for ever.
+//
+// Cleared only by a reset. There is no state here worth preserving across one,
+// and adding a way to clear it would be a mechanism this stage does not need.
+uint16_t lineLeftMin = ADC_MAX_VALUE;
+uint16_t lineLeftMax = 0;
+uint16_t lineRightMin = ADC_MAX_VALUE;
+uint16_t lineRightMax = 0;
+
+// The worst interval observed between two consecutive line reads.
+//
+// This is the number the calibration rate stands or falls on. The loop asks for
+// a rate; what it gets is that rate plus whatever blocked in between, and
+// readEchoMedian waiting out three ultrasonic timeouts is by far the largest of
+// those. Asking for 10 ms means nothing if the loop can only deliver 85.
+unsigned long lineGapMaxMs = 0;
+
+// Reads counted since the last summary, which turns the elapsed window into an
+// average interval. The maximum above catches the worst case; this says whether
+// that case was an outlier or the normal state of affairs.
+uint16_t lineReadsInWindow = 0;
 
 // What the operator has asked for, in the form drive() already takes: sign is
 // direction, magnitude is duty.
@@ -1496,27 +1558,88 @@ void loop() {
     }
   }
 
-  // Data collection only: read and report. No thresholds, no decisions.
-  if (now - lastLinePrint >= LINE_PRINT_INTERVAL_MS) {
-    lastLinePrint = now;
+  // Data collection only: read and accumulate. No thresholds, no decisions, and
+  // no printing - the summary below reports on a clock of its own.
+  if (now - lastLineRead >= lineReadIntervalMs) {
+    // Taken before the timestamp is overwritten, because the useful number is
+    // the distance between two runs that actually happened rather than the one
+    // that was asked for. The scheduler above re-arms from now rather than from
+    // the previous deadline, so a pass that arrives late stays late instead of
+    // being caught up - which is the honest thing to measure.
+    //
+    // The first read has nothing to measure against: lastLineRead is still the
+    // zero it was initialised to, and now is already seconds past boot, so the
+    // whole of setup() would be recorded as one gap and would sit in the
+    // maximum for the rest of the run.
+    if (lastLineRead != 0) {
+      const unsigned long gap = now - lastLineRead;
+
+      if (gap > lineGapMaxMs) {
+        lineGapMaxMs = gap;
+      }
+    }
+
+    lastLineRead = now;
+    lineReadsInWindow++;
 
     lineLeftValue = readLineAveraged(PIN_LINE_SENSOR_LEFT);
     lineRightValue = readLineAveraged(PIN_LINE_SENSOR_RIGHT);
 
-    // A bench aid, not a control input. Both sensors read white while the rover
-    // is inside the lane, so this difference rests at a non-zero constant there
-    // and only moves once one of them reaches a stripe. How the LKA turns the
-    // two readings into an error signal is still open.
-    const int16_t delta = static_cast<int16_t>(lineLeftValue) -
-                          static_cast<int16_t>(lineRightValue);
+    // Widened one reading at a time. Nothing here decides anything: this stage
+    // only establishes whether a span exists at all and how fast it can be
+    // sampled, which is what the calibration will later be built on.
+    lineLeftMin = min(lineLeftMin, lineLeftValue);
+    lineLeftMax = max(lineLeftMax, lineLeftValue);
+    lineRightMin = min(lineRightMin, lineRightValue);
+    lineRightMax = max(lineRightMax, lineRightValue);
+  }
 
-    if (LOG_LINE) {
+  // Reported on its own clock, slowly, for the reason given at
+  // LINE_SUMMARY_INTERVAL_MS: printing per read would block on the serial
+  // buffer and stretch the interval being measured.
+  //
+  // The first window is discarded rather than reported. It starts at the zero
+  // the timestamp was initialised to and therefore spans the whole of setup(),
+  // so its average would describe the boot rather than the loop - the same
+  // reasoning as the first gap above.
+  if (lastLineSummary == 0) {
+    lastLineSummary = now;
+    lineReadsInWindow = 0;
+  } else if (now - lastLineSummary >= LINE_SUMMARY_INTERVAL_MS) {
+    const unsigned long elapsed = now - lastLineSummary;
+    const uint16_t reads = lineReadsInWindow;
+
+    lastLineSummary = now;
+    lineReadsInWindow = 0;
+
+    // A window with no reads in it has no average to report and would divide by
+    // zero working one out.
+    if (LOG_LINE && reads > 0) {
       Serial.print("LINE  L=");
       Serial.print(lineLeftValue);
-      Serial.print("  R=");
+      Serial.print(" [");
+      Serial.print(lineLeftMin);
+      Serial.print("..");
+      Serial.print(lineLeftMax);
+      Serial.print(" span ");
+      Serial.print(lineLeftMax - lineLeftMin);
+      Serial.print("]  R=");
       Serial.print(lineRightValue);
-      Serial.print("  delta=");
-      Serial.println(delta);
+      Serial.print(" [");
+      Serial.print(lineRightMin);
+      Serial.print("..");
+      Serial.print(lineRightMax);
+      Serial.print(" span ");
+      Serial.print(lineRightMax - lineRightMin);
+      Serial.print("]  reads=");
+      Serial.print(reads);
+      Serial.print(" asked=");
+      Serial.print(lineReadIntervalMs);
+      Serial.print("ms avg=");
+      Serial.print(elapsed / reads);
+      Serial.print("ms max=");
+      Serial.print(lineGapMaxMs);
+      Serial.println("ms");
     }
   }
 
