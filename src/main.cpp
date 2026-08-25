@@ -279,37 +279,19 @@ constexpr uint32_t PWM_MAX_DUTY =
     (1UL << PWM_RESOLUTION_BITS) - 1; // UL unsigned long
 
 // --- Timing ---
-// The resting rate the line sensors are read at, and the one the loop returns
-// to. Named READ rather than PRINT because the two are no longer the same
-// thing: the reading runs on this clock, the reporting on one of its own
-// below. They were a single rate until the calibration needed a fast read
-// without a fast print.
+// The rate the line sensors are read at.
+//
+// Named READ rather than PRINT because the two are no longer the same thing:
+// the reading runs on this clock, the reporting on one of its own below. They
+// were a single rate until the reporting had to be slowed down independently.
 constexpr unsigned long LINE_READ_INTERVAL_MS = 200;
-
-// The rate the line sensors are read at while a calibration spin is running.
-//
-// Kept next to the resting rate above because they are the two values one
-// variable takes, and a pair that has to stay consistent is worth nothing if
-// the two halves sit in different parts of the file.
-//
-// The number comes from how long a sensor is actually over a stripe. Spinning
-// on the spot at full duty, the measured 15 cm wheel track puts the sensor
-// across a 2.4 cm stripe in roughly 34 ms. At 20 ms that window holds about 1.7
-// samples, which rounds down to one or none on an unlucky crossing; at 10 ms it
-// holds about 3.4, and missing a stripe stops being a matter of luck.
-//
-// This rate is only reachable because the distance reads are suspended for the
-// same three seconds. readEchoMedian waits out three ultrasonic timeouts on an
-// open road and blocks for up to 85 ms, which would swallow the interval whole.
-constexpr unsigned long LINE_READ_CALIBRATION_MS = 10;
 
 // How often the accumulated span and timing are reported.
 //
-// Deliberately far slower than the read. At the calibration rate the read block
-// runs a hundred times a second, and a line per read would not merely flood the
-// terminal: Serial.print blocks once the transmit buffer fills, so the
-// reporting would stretch the very interval it exists to measure. An instrument
-// that disturbs what it measures is worth nothing.
+// Deliberately slower than the read, so that reporting stays off the critical
+// path. Serial.print blocks once the transmit buffer fills, and an instrument
+// that disturbs what it measures is worth nothing - the timing figures below
+// are measured in milliseconds, which is the range a blocked write lands in.
 constexpr unsigned long LINE_SUMMARY_INTERVAL_MS = 500;
 
 // How often the screen is asked whether anything it shows has changed. The ask
@@ -640,19 +622,19 @@ constexpr unsigned long AEB_READING_MAX_AGE_MS = 300;
 // different place in each. So was a ratio: white to black was 2.3 in one room
 // and 18.5 in the other. Both ends have to be measured.
 //
-// Full duty, and not the 62% that would double the time over a stripe. A spin
-// on the spot has all four wheels scrubbing sideways, and at 62% whether it
-// turns at all depends on the surface and on how tired the cells are. Full duty
-// turns every time, which is also what should happen in front of an examiner.
-constexpr uint8_t CAL_SPIN_PERCENT = 100;
-static_assert(CAL_SPIN_PERCENT >= DRIVE_MIN_PERCENT,
-              "calibration spin below the duty the motors start at would not "
-              "turn the rover");
+// Ignored before any reading is kept. The button has just been released, so a
+// finger is leaving the rover and the chassis is still rocking on its springs;
+// a reading taken now describes that rather than the surface.
+constexpr unsigned long CAL_SETTLE_MS = 200;
 
-// Per direction, so a calibration is twice this. Out and back rather than one
-// continuous turn, so the rover finishes roughly where it started instead of
-// wandering off its own track.
-constexpr unsigned long CAL_SPIN_DIRECTION_MS = 1500;
+// How long readings are accumulated for.
+//
+// Short on purpose. readLineAveraged already averages 16 samples, and
+// successive reads of a steady surface differ by about 5 counts, so the tenth
+// read adds almost nothing the third did not. Seconds of standing still would
+// buy precision that the drift between measurements - up to 65 counts - throws
+// away again anyway.
+constexpr unsigned long CAL_SAMPLE_MS = 600;
 
 // How long the button has to be held for the release to start a calibration.
 // Long enough not to fire on an ordinary press, short enough not to feel stuck.
@@ -669,21 +651,27 @@ enum class StopMode : uint8_t { Coast, Brake };
 
 // Where the line sensor calibration has got to.
 //
-// The two spins are separate states rather than one state with a direction
-// flag, because they are what the loop compares against to know whether the
-// rover is turning at all - and a single state would make that question
-// "spinning, and also which way", which is two questions.
+// The rover does not move during any of this. An earlier version turned on the
+// spot to make both sensors see a stripe, and it is worth knowing why that is
+// gone: on the floor, under load, four driven wheels with no caster would not
+// turn reliably - one wheel would go and the rest would sit. Batteries,
+// surface, wheels and weight were each checked and ruled out. It is the wheel
+// scrub noted in journal session 11, and a turn on the spot needed full duty
+// to begin with.
 //
-// Done is not a moment, it is a condition that lasts: it says a calibration has
-// completed and its snapshot is worth reading. It holds until the next
-// calibration or until power is removed, which is the whole of how the result
-// is stored. Idle covers both "never calibrated" and "aborted", and those are
-// the same thing to everything downstream - there is no snapshot either way.
+// What replaced it needs no stripe at all. The measurement here is the resting
+// difference between the two sensors, which is taken standing still on white.
 //
-// No Failed here. Nothing in this stage judges the result; that arrives with
-// the sanity check, and inventing the state before anything can set it would be
-// a state the code cannot reach.
-enum class CalPhase : uint8_t { Idle, SpinA, SpinB, Done };
+// Settling is separate from Sampling because a hand has just let go of the
+// button and possibly of the rover. Readings taken during that are readings of
+// someone's grip.
+//
+// Ready is not a moment, it is a condition that lasts: it says a zero point has
+// been measured and is worth using. It holds until the next calibration or
+// until power is removed, which is the whole of how the result is stored. Idle
+// covers both "never calibrated" and "aborted" - to everything downstream those
+// are the same thing, because there is no zero point either way.
+enum class CalPhase : uint8_t { Idle, Settling, Sampling, Ready };
 
 // Previous button reading, so the loop can report changes instead of flooding
 // the serial line on every pass while the button is held down.
@@ -698,12 +686,6 @@ unsigned long buttonPressedAtMs = 0;
 
 unsigned long lastLineRead = 0;
 unsigned long lastLineSummary = 0;
-
-// The rate the line sensors are actually being read at right now. A variable
-// rather than a constant because the calibration raises it for the few seconds
-// it runs and then puts it back; LINE_READ_INTERVAL_MS is the value it is put
-// back to, so the resting rate is never written as a bare number.
-unsigned long lineReadIntervalMs = LINE_READ_INTERVAL_MS;
 
 unsigned long lastDistanceRead = 0;
 unsigned long lastWebHandle = 0;
@@ -775,23 +757,9 @@ unsigned long lineGapMaxMs = 0;
 // that case was an outlier or the normal state of affairs.
 uint16_t lineReadsInWindow = 0;
 
-// The span each sensor saw during the last completed calibration spin, frozen
-// at the moment that spin ended.
-//
-// Separate from the running accumulators above, and the separation is the
-// point. Those keep moving: the loop goes on reading the line sensors every
-// LINE_READ_INTERVAL_MS once the spin is over, so a threshold computed from
-// them later would be computed from numbers that have since drifted - over
-// whatever the rover happens to be parked on. These four stop when the spin
-// stops and nothing writes them again until the next one.
-uint16_t calLeftMin = 0;
-uint16_t calLeftMax = 0;
-uint16_t calRightMin = 0;
-uint16_t calRightMax = 0;
-
 // Where the calibration has got to, and when the current phase began. Idle
-// until a long press starts one; Done from the end of a spin until the next
-// calibration or the next power cycle.
+// until a long press starts one; Ready from the end of a measurement until the
+// next calibration or the next power cycle.
 CalPhase calPhase = CalPhase::Idle;
 unsigned long calPhaseStartMs = 0;
 
@@ -845,16 +813,15 @@ static uint32_t dutyFromPercent(uint8_t percent) {
 // The stage arrives as an argument rather than being read from the global, so
 // the indicators report the stage that was actually enforced - including one
 // forced by a stale reading, which the global does not know about.
-// True while a calibration spin is turning the rover.
+// True while a calibration is measuring.
 //
-// Derived from the phase on every call rather than kept as a flag that the
+// Derived from the phase on every call rather than kept as a flag the
 // calibration raises and lowers. A flag would have to be cleared on every way
 // out - the normal end, the button abort, and any path added later - and one
-// missed clear leaves the AEB permanently unable to sound. That failure is
-// silent by its nature: nothing looks wrong until the day the buzzer is needed.
-// A condition computed from the state it describes cannot be left behind.
-static bool calibrationSpinning() {
-  return calPhase == CalPhase::SpinA || calPhase == CalPhase::SpinB;
+// missed clear leaves a stale claim behind. A condition computed from the state
+// it describes cannot be left behind.
+static bool calibrationRunning() {
+  return calPhase == CalPhase::Settling || calPhase == CalPhase::Sampling;
 }
 
 static void applyAebOutputs(bool movingForward, AebStage stage) {
@@ -867,28 +834,7 @@ static void applyAebOutputs(bool movingForward, AebStage stage) {
   const bool braking =
       movingForward && (stage == AebStage::Slow || stage == AebStage::Stop);
 
-  // The calibration owns the buzzer for the seconds it spins, and this is the
-  // one thing allowed to take it.
-  //
-  // Not a convenience. The distance reads are suspended for that spin, so
-  // safeDrive sees a reading that has stopped arriving and forces Stop - and a
-  // pivot has one side positive, so movingForward is true and this would sound
-  // continuously. That Stop is not a detection. It is this code being told to
-  // stop measuring, and a warning produced by switching the sensor off carries
-  // no information about the world at all. It would also drown out the
-  // calibration's own signalling, which does carry information.
-  //
-  // What must not happen is silencing a real warning, and that cannot happen
-  // here: a calibration only ever runs from a standstill, never while the rover
-  // is being driven at anything.
-  //
-  // The brake light is deliberately left alone. It comes from the same false
-  // Stop, but it drowns out nothing, and a lit lamp during a spin is a fair
-  // enough sign that the rover is busy.
-  if (!calibrationSpinning()) {
-    digitalWrite(PIN_BUZZER, sounding ? BUZZER_SOUND : BUZZER_SILENT);
-  }
-
+  digitalWrite(PIN_BUZZER, sounding ? BUZZER_SOUND : BUZZER_SILENT);
   ledcWrite(PIN_BRAKE_LIGHT, braking ? PWM_MAX_DUTY : 0);
 }
 
@@ -1237,22 +1183,17 @@ static void confirmWarnStage() {
   }
 }
 
-// Begins a calibration: clears what the last one left behind and puts the loop
-// into its fast read rate.
+// Begins a calibration: clears what the last one left behind and starts the
+// settling window.
 //
-// The running accumulators are reset here rather than merely read at the end,
-// and that reset is most of what makes the result mean anything. They hold
-// whatever the sensors have seen since boot, which includes the rover being
-// carried, set down on a dark surface, or pushed across a stripe by hand. Any
-// one of those leaves an extreme behind that never came from this spin, and a
-// span stretched by it produces a threshold in the wrong place - quietly, with
-// every number still looking plausible.
+// The running accumulators are reset here rather than merely read at the end.
+// They hold whatever the sensors have seen since boot, which includes the rover
+// being carried, set down on a dark surface, or pushed across a stripe by hand.
+// Any one of those leaves an extreme behind that this measurement never saw.
 //
-// lineGapMaxMs is cleared for the same reason and a sharper one. Left alone it
-// would still hold the worst gap from before the spin, measured at the resting
-// rate with the distance reads running and blocking for up to 85 ms. Cleared,
-// it reports on the calibration window alone, which is the only window the
-// question was ever about.
+// lineGapMaxMs is cleared for the same reason: left alone it would still hold
+// the worst gap from before, and after a reset it describes the measurement
+// window alone.
 static void startCalibration() {
   lineLeftMin = ADC_MAX_VALUE;
   lineLeftMax = 0;
@@ -1261,9 +1202,7 @@ static void startCalibration() {
 
   lineGapMaxMs = 0;
 
-  lineReadIntervalMs = LINE_READ_CALIBRATION_MS;
-
-  calPhase = CalPhase::SpinA;
+  calPhase = CalPhase::Settling;
   calPhaseStartMs = millis();
 
   Serial.println("CAL  start");
@@ -1271,97 +1210,50 @@ static void startCalibration() {
 
 // The one way out, taken by both the normal end and the button abort.
 //
-// Shared rather than written at each exit on purpose: restoring the read rate
-// and releasing the motors has to happen on every path, and two copies is one
-// copy that can be forgotten. An abort that left the loop at the calibration
-// rate would read the line sensors a hundred times a second for the rest of the
-// session, for nothing.
+// Shared rather than written at each exit on purpose. There is little to undo
+// today, but every exit path having one place to do it is what kept the earlier
+// version honest, and the measurement that lands here next will have state of
+// its own to settle.
 //
-// Only a completed spin takes the snapshot. An aborted one has swept part of a
-// stripe at best, and a partial span looks exactly like a real one - it is a
-// number in the right range, arrived at from too little. Idle says there is no
-// result, which is the truth, and nothing downstream will read the snapshot.
+// Only a completed measurement leaves Ready behind. An aborted one has sampled
+// part of a window at best, and a partial average looks exactly like a real one
+// - a number in the right range, arrived at from too little. Idle says there is
+// no result, which is the truth.
 static void endCalibration(bool completed) {
-  if (completed) {
-    calLeftMin = lineLeftMin;
-    calLeftMax = lineLeftMax;
-    calRightMin = lineRightMin;
-    calRightMax = lineRightMax;
-  }
+  calPhase = completed ? CalPhase::Ready : CalPhase::Idle;
 
-  calPhase = completed ? CalPhase::Done : CalPhase::Idle;
-
-  lineReadIntervalMs = LINE_READ_INTERVAL_MS;
-
-  // Released explicitly rather than left for the watchdog. The last spin
-  // command is still written, and waiting for the timeout would keep the rover
-  // turning for another COMMAND_TIMEOUT_MS after it was told to stop.
-  commandedLeft = 0;
-  commandedRight = 0;
-
-  if (!completed) {
-    Serial.println("CAL  aborted");
-    return;
-  }
-
-  Serial.print("CAL  done  L ");
-  Serial.print(calLeftMin);
-  Serial.print("..");
-  Serial.print(calLeftMax);
-  Serial.print(" span ");
-  Serial.print(calLeftMax - calLeftMin);
-  Serial.print("   R ");
-  Serial.print(calRightMin);
-  Serial.print("..");
-  Serial.print(calRightMax);
-  Serial.print(" span ");
-  Serial.println(calRightMax - calRightMin);
+  Serial.println(completed ? "CAL  done" : "CAL  aborted");
 }
 
-// Drives the spin, one loop pass at a time.
+// Steps the calibration, one loop pass at a time.
 //
-// Nothing here blocks. The spin lasts seconds, and the way a non-blocking loop
-// spends seconds is by comparing millis() against the moment the phase began
-// and returning, which is the same shape the rest of the loop already uses.
+// Nothing here blocks and nothing here moves. The rover stands still for the
+// whole of this: the spin that used to live here could not be made reliable on
+// the floor, and what replaced it needs no motion at all. The way a
+// non-blocking loop spends time is by comparing millis() against the moment the
+// phase began and returning, which is the shape the rest of the loop uses.
 //
-// It writes commandedLeft and commandedRight and stops there. It does not call
-// drive, and it does not call safeDrive: this records intent exactly as a
-// request handler does, and the single write to the motors stays where it is,
-// once a pass, after the safety layer has had its say. A pivot reaches the
-// motors untouched anyway - one side is negative, so safeDrive takes the escape
-// path before it ever reaches the stop test.
+// It writes no motor command, so safeDrive and the AEB below it are untouched
+// by a calibration - there is no moment in this project where the rover drives
+// forward without them.
 static void updateCalibration() {
-  if (!calibrationSpinning()) {
+  if (!calibrationRunning()) {
     return;
   }
 
   const unsigned long now = millis();
 
-  if (now - calPhaseStartMs >= CAL_SPIN_DIRECTION_MS) {
-    if (calPhase == CalPhase::SpinA) {
-      calPhase = CalPhase::SpinB;
+  if (calPhase == CalPhase::Settling) {
+    if (now - calPhaseStartMs >= CAL_SETTLE_MS) {
+      calPhase = CalPhase::Sampling;
       calPhaseStartMs = now;
-    } else {
-      endCalibration(true);
-      return;
     }
+    return;
   }
 
-  // Opposite signs are what makes this a turn on the spot rather than a curve:
-  // one side forward, one side back, and the rover rotates about a point
-  // between them instead of travelling. The second phase reverses both, so the
-  // rover comes back to roughly where it started rather than walking off its
-  // own track over repeated calibrations.
-  const int16_t duty = static_cast<int16_t>(dutyFromPercent(CAL_SPIN_PERCENT));
-  const bool firstDirection = (calPhase == CalPhase::SpinA);
-
-  commandedLeft = firstDirection ? duty : static_cast<int16_t>(-duty);
-  commandedRight = firstDirection ? static_cast<int16_t>(-duty) : duty;
-
-  // The calibration is a command source like any other, so it feeds the
-  // watchdog instead of being excused from it. Silence still means stop; this
-  // is simply not silence. Nothing about the timeout itself changes.
-  lastCommandMs = now;
+  if (now - calPhaseStartMs >= CAL_SAMPLE_MS) {
+    endCalibration(true);
+  }
 }
 
 // Draws the status screen. Replaces the phase 2 test screen, which had proved
@@ -1819,11 +1711,10 @@ void loop() {
       // keep the release that follows from acting a second time.
       const unsigned long held = now - buttonPressedAtMs;
 
-      if (calibrationSpinning()) {
-        // Any release stops a running calibration, not only a short one. The
-        // rover is turning on the floor at full duty, and the button being an
-        // unconditional stop is worth more than the button being able to do two
-        // different things while it turns.
+      if (calibrationRunning()) {
+        // Any release stops a running calibration, not only a short one. One
+        // button that always means "stop what you are doing" is worth more than
+        // a button that means two things depending on how long it was held.
         endCalibration(false);
       } else if (held >= CAL_BUTTON_LONG_MS) {
         startCalibration();
@@ -1833,7 +1724,7 @@ void loop() {
 
   // Data collection only: read and accumulate. No thresholds, no decisions, and
   // no printing - the summary below reports on a clock of its own.
-  if (now - lastLineRead >= lineReadIntervalMs) {
+  if (now - lastLineRead >= LINE_READ_INTERVAL_MS) {
     // Taken before the timestamp is overwritten, because the useful number is
     // the distance between two runs that actually happened rather than the one
     // that was asked for. The scheduler above re-arms from now rather than from
@@ -1907,7 +1798,7 @@ void loop() {
       Serial.print("]  reads=");
       Serial.print(reads);
       Serial.print(" asked=");
-      Serial.print(lineReadIntervalMs);
+      Serial.print(LINE_READ_INTERVAL_MS);
       Serial.print("ms avg=");
       Serial.print(elapsed / reads);
       Serial.print("ms max=");
@@ -1921,26 +1812,7 @@ void loop() {
   // fixed target, so the filter is not there to smooth a wobble. It is there
   // for the occasional sample that comes back badly wrong, which is what a
   // moving, vibrating vehicle will produce.
-  //
-  // Suspended for the seconds a calibration spins, and that is a deliberate
-  // suspension of the safety layer rather than a side effect of one. It is
-  // written here because it has to be impossible to meet this line and not know
-  // it: for those three seconds there is no AEB.
-  //
-  // The reason is that this measurement is the thing blocking the calibration.
-  // readEchoMedian waits out three ultrasonic timeouts, up to 85 ms, and it
-  // does so precisely on the open road a calibration is required to start from,
-  // where nothing comes back at all. Leaving it running would hold the line
-  // reads at roughly 85 ms apart when the stripe is only under a sensor for 34,
-  // and the calibration would sample noise and call it a span.
-  //
-  // What is given up is small and bounded. The rover turns on the spot, so it
-  // closes on nothing; an obstacle in front stays the distance away it already
-  // was. safeDrive keeps working throughout - it sees the reading go stale and
-  // forces Stop, and a pivot passes anyway because one side is negative and it
-  // takes the escape path first.
-  if (!calibrationSpinning() &&
-      now - lastDistanceRead >= DISTANCE_READ_INTERVAL_MS) {
+  if (now - lastDistanceRead >= DISTANCE_READ_INTERVAL_MS) {
     lastDistanceRead = now;
 
     // Both values get printed: the pulse says whether a bad number came from
