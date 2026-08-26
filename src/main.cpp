@@ -2505,7 +2505,30 @@ void loop() {
   // and safeDrive, so what it writes is judged like any other command.
   updateLka();
 
-  if (!commandTimedOut && now - lastCommandMs >= COMMAND_TIMEOUT_MS) {
+  // ⚠️ millis() here, NOT the loop's cached now, and the difference is not
+  // cosmetic - this line read `now` for a day and the rover was unusable.
+  //
+  // now is taken once at the top of the pass. Every other schedule in this loop
+  // compares it against a stamp written as `= now`, so the stamp can never be
+  // newer than now and a stale now only makes a check fire slightly late.
+  // lastCommandMs is the one exception in the whole loop: updateLka writes it
+  // from live millis(), several lines and one blocking distance read further
+  // down the pass - up to 92 ms after now was taken.
+  //
+  // These are unsigned. now - lastCommandMs with lastCommandMs the larger of
+  // the two does not go negative, it wraps to about 4.29 billion, which clears
+  // any timeout ever written. So the watchdog fired on a command issued
+  // microseconds earlier and cut the motors.
+  //
+  // It did not fire continuously, which is what hid it: commandTimedOut latches
+  // and silences it - until the dashboard's 120 ms heartbeat cleared the latch
+  // and armed it again. With the page shut the rover drove perfectly; with the
+  // page open the motors were cut about eight times a second. Opening the
+  // dashboard to watch the fault was what caused it.
+  //
+  // A safety timer asks how long ago something happened. It has to read the
+  // clock when it asks, not remember what the clock said earlier in the pass.
+  if (!commandTimedOut && millis() - lastCommandMs >= COMMAND_TIMEOUT_MS) {
     commandedLeft = 0;
     commandedRight = 0;
     commandTimedOut = true;
