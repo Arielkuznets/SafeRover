@@ -711,20 +711,27 @@ constexpr int32_t LINE_DIFF_FULL_SCALE = 600;
 // It intervenes on approach to a marking; it does not hold the middle.
 constexpr int32_t LKA_DEADBAND = 200;
 
-// Starting values, both overwritable from the dashboard while tuning and both
-// meant to be replaced here once the tuning finds them.
+// Found on the floor, not chosen. Still overwritable from the dashboard, but
+// these are now the values the rover actually keeps a lane with rather than a
+// place to start looking from.
 //
-// Kp is the duty difference applied between the two sides when a sensor is
-// fully over a stripe - that is the whole of its physical meaning. It starts
-// low because the way to find it is upwards: raise until the rover weaves, then
-// come back about a third.
+// Kp is the duty difference applied between the two sides at the far end of the
+// error range - that is the whole of its physical meaning, and it moves with
+// LINE_DIFF_FULL_SCALE above, so the two cannot be read apart.
 //
-// The base speed is the slowest the motors reliably start at, which is also the
-// most reaction time the controller can be given. It must be settled before Kp
-// is tuned, not after: the speed response is not linear - 1.6x the duty gives
-// 2.6x the speed - so a Kp found at one speed does not carry to another.
-constexpr uint8_t LKA_KP_DEFAULT = 15;
-constexpr uint8_t LKA_BASE_PERCENT_DEFAULT = DRIVE_MIN_PERCENT;
+// ⚠️ The base speed was DRIVE_MIN_PERCENT and that was a trap, not a starting
+// point. That constant is the duty at which the wheels stop turning, so a base
+// sitting on it leaves no room underneath: every correction, however small,
+// puts the slower side below the floor, and the rover judders instead of
+// steering. It also came back on every reset, since these live in RAM, and cost
+// a long session of chasing a fault that was a stale default.
+//
+// The assert below is the same guard the AEB already carries for
+// AEB_SLOW_PERCENT. That layer got this right first; this one did not.
+constexpr uint8_t LKA_KP_DEFAULT = 45;
+constexpr uint8_t LKA_BASE_PERCENT_DEFAULT = 85;
+static_assert(LKA_BASE_PERCENT_DEFAULT > DRIVE_MIN_PERCENT,
+              "a base speed on the stall floor leaves no room to correct");
 
 // The largest Kp the dashboard will accept.
 //
@@ -738,16 +745,25 @@ static_assert(LKA_KP_MAX <= PWM_MAX_DUTY,
 
 // How many readings the error is smoothed over.
 //
-// The error signal is read once every 50-80 ms and acted on immediately, so a
-// single wild reading becomes a steering command on its own. Smoothing over a
-// few readings tells a brief disturbance from a sustained one: a bump under a
-// sensor lasts 50 to 100 ms, while a real drift across the lane takes one to
-// two seconds.
+// ⚠️ 1 means no smoothing, and it is the measured setting rather than an
+// unfinished one.
 //
-// 4 readings is roughly a quarter second at the rate this loop delivers.
-// Setting it to 1 disables the smoothing entirely, which is what makes the
-// comparison with and without possible on the floor without a rebuild.
-constexpr uint8_t LKA_FILTER_DEFAULT = 4;
+// The raw error was logged across a full run: each 500 ms window spanned 7 to
+// 30 counts while the value itself drifted smoothly over tens of seconds. A
+// signal that clean gives a moving average nothing to remove, and switching one
+// on changed nothing on the floor - which is the same statement twice, since an
+// average passes a sustained signal and only swallows a brief one.
+//
+// An earlier reading of the same data put the spread at about 860 counts. That
+// came from nine samples taken minutes apart, where a slow trend is
+// indistinguishable from scatter.
+//
+// The mechanism is kept because it is the right instrument if the surface ever
+// does get rough, and at 1 it costs a multiply and a divide by one.
+//
+// Above 1 it smooths over that many readings, roughly 50-80 ms each, and adds
+// that much delay - the wrong direction for a controller already reacting late.
+constexpr uint8_t LKA_FILTER_DEFAULT = 1;
 constexpr uint8_t LKA_FILTER_MAX = 32;
 static_assert(LKA_FILTER_DEFAULT >= 1,
               "a filter length below 1 divides by zero");
