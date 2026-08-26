@@ -736,6 +736,22 @@ constexpr uint8_t LKA_KP_MAX = 120;
 static_assert(LKA_KP_MAX <= PWM_MAX_DUTY,
               "a Kp above full duty cannot reach the motors");
 
+// How many readings the error is smoothed over.
+//
+// The error signal is read once every 50-80 ms and acted on immediately, so a
+// single wild reading becomes a steering command on its own. Smoothing over a
+// few readings tells a brief disturbance from a sustained one: a bump under a
+// sensor lasts 50 to 100 ms, while a real drift across the lane takes one to
+// two seconds.
+//
+// 4 readings is roughly a quarter second at the rate this loop delivers.
+// Setting it to 1 disables the smoothing entirely, which is what makes the
+// comparison with and without possible on the floor without a rebuild.
+constexpr uint8_t LKA_FILTER_DEFAULT = 4;
+constexpr uint8_t LKA_FILTER_MAX = 32;
+static_assert(LKA_FILTER_DEFAULT >= 1,
+              "a filter length below 1 divides by zero");
+
 // How far above its calibrated white a sensor has to read to count as being
 // over black.
 //
@@ -957,6 +973,20 @@ bool lkaErrorSeen = false;
 // above, as defaults, rather than living only in a phone that gets closed.
 uint8_t lkaKp = LKA_KP_DEFAULT;
 uint8_t lkaBasePercent = LKA_BASE_PERCENT_DEFAULT;
+
+// The smoothing, and the two pieces of state it needs.
+//
+// lkaErrorAcc holds the running value multiplied by the filter length. That
+// scaling is what lets integer arithmetic converge: the remainder stays inside
+// the accumulator instead of being rounded away on every pass, which would
+// leave the filter permanently short of the value it is chasing.
+//
+// The primed flag seeds the accumulator from the first reading after the
+// controller starts rather than climbing to it from zero, so engaging the lane
+// keeping does not open with a quarter second of invented error.
+uint8_t lkaFilterSamples = LKA_FILTER_DEFAULT;
+int32_t lkaErrorAcc = 0;
+bool lkaFilterPrimed = false;
 
 // What the operator has asked for, in the form drive() already takes: sign is
 // direction, magnitude is duty.
@@ -1565,6 +1595,10 @@ static void updateCalibration() {
 // here, and that ordering is the whole point of the seam built in phase 4.
 static void updateLka() {
   if (!lkaActive) {
+    // Held cleared while the controller is off, so every engagement starts
+    // from the readings in front of it rather than from whatever the rover
+    // happened to be doing when it last stopped.
+    lkaFilterPrimed = false;
     return;
   }
 
@@ -1602,6 +1636,25 @@ static void updateLka() {
     lkaErrorMin = min(lkaErrorMin, error);
     lkaErrorMax = max(lkaErrorMax, error);
   }
+
+  // Everything above this line describes the measurement. Everything below it
+  // acts on one. The noise comes out here, after the recording rather than
+  // before it, so err raw on the dashboard stays the honest signal and the two
+  // can be read side by side while the rover drives.
+  //
+  // Each reading moves the stored value one filter-length of the way towards
+  // itself. A single wild reading barely shifts it and the next one pulls it
+  // back; a run of readings all leaning the same way carries it the whole way.
+  // The filter does not weaken the signal - it tells brief from sustained.
+  if (!lkaFilterPrimed) {
+    lkaErrorAcc = error * static_cast<int32_t>(lkaFilterSamples);
+    lkaFilterPrimed = true;
+  } else {
+    lkaErrorAcc +=
+        error - (lkaErrorAcc / static_cast<int32_t>(lkaFilterSamples));
+  }
+
+  error = lkaErrorAcc / static_cast<int32_t>(lkaFilterSamples);
 
   // Inside the lane neither sensor has reached a stripe and there is nothing to
   // correct - but a difference always has some value: noise, drift, the ADC.
@@ -1751,6 +1804,7 @@ static void handleRoot() {
   page.replace("%MIN_PERCENT%", String(DRIVE_MIN_PERCENT));
   page.replace("%START_PERCENT%", String(DRIVE_START_PERCENT));
   page.replace("%KP_MAX%", String(LKA_KP_MAX));
+  page.replace("%FILTER_MAX%", String(LKA_FILTER_MAX));
 
   server.send(200, "text/html", page);
 }
@@ -1797,6 +1851,8 @@ static void handleData() {
   json += lkaKp;
   json += ",\"base\":";
   json += lkaBasePercent;
+  json += ",\"filter\":";
+  json += lkaFilterSamples;
 
   // How fast the controller above is actually being fed. Reported beside what
   // it decided, because a correction and the age of the reading it was made
@@ -2043,6 +2099,27 @@ static void handleTune() {
     changed = true;
   }
 
+  if (server.hasArg("filter")) {
+    const long filter = server.arg("filter").toInt();
+
+    // 1 is the floor rather than 0, and it means no smoothing at all: the
+    // stored value moves the whole way to each reading. Zero would divide by
+    // zero, and toInt() answers zero for anything it cannot parse, so this
+    // rejection also catches a mistyped field.
+    if (filter < 1 || filter > LKA_FILTER_MAX) {
+      server.send(400, "text/plain", "bad filter");
+      return;
+    }
+
+    lkaFilterSamples = static_cast<uint8_t>(filter);
+
+    // The accumulator holds the running value scaled by the OLD length, so
+    // dividing it by the new one would report a number nobody measured.
+    // Re-seeding from the next reading is cheaper and clearer than rescaling.
+    lkaFilterPrimed = false;
+    changed = true;
+  }
+
   if (!changed) {
     server.send(400, "text/plain", "nothing to set");
     return;
@@ -2051,7 +2128,9 @@ static void handleTune() {
   Serial.print("TUNE  kp=");
   Serial.print(lkaKp);
   Serial.print("  base=");
-  Serial.println(lkaBasePercent);
+  Serial.print(lkaBasePercent);
+  Serial.print("  filter=");
+  Serial.println(lkaFilterSamples);
 
   server.send(200, "text/plain", "ok");
 }
