@@ -284,7 +284,18 @@ constexpr uint32_t PWM_MAX_DUTY =
 // Named READ rather than PRINT because the two are no longer the same thing:
 // the reading runs on this clock, the reporting on one of its own below. They
 // were a single rate until the reporting had to be slowed down independently.
-constexpr unsigned long LINE_READ_INTERVAL_MS = 200;
+//
+// The value did not follow the rename, and for the whole of the first LKA run
+// the controller steered on data 200 ms old - about 13 cm of ground at the
+// speed it drives. A cadence chosen for a human reading a serial log had
+// become the sampling rate of a control loop.
+//
+// 20 ms is deliberately below what this loop can deliver. The ceiling is
+// readEchoMedian, which blocks for up to 85 ms waiting out three ultrasonic
+// timeouts, and it does that precisely when the road ahead is clear. Asking
+// for less than the ceiling is what makes the summary report the rate that was
+// ACHIEVED rather than the rate that was requested.
+constexpr unsigned long LINE_READ_INTERVAL_MS = 20;
 
 // How often the accumulated span and timing are reported.
 //
@@ -859,6 +870,15 @@ unsigned long lineGapMaxMs = 0;
 // that case was an outlier or the normal state of affairs.
 uint16_t lineReadsInWindow = 0;
 
+// The average interval over the last summary window, kept for the dashboard.
+//
+// The maximum above is a worst case and can be a single bad pass; this is what
+// the controller experiences most of the time. Stored rather than only printed
+// because the rover runs untethered - serial needs a cable, the cable drags
+// behind the rover and changes the physics being measured, and plugging one in
+// afterwards resets the board and takes the measurement with it.
+unsigned long lineAvgGapMs = 0;
+
 // Where the calibration has got to, and when the current phase began. Idle
 // until a long press starts one; Ready from the end of a measurement until the
 // next calibration or the next power cycle.
@@ -908,6 +928,25 @@ bool lkaActive = false;
 // The last error the controller computed, kept for the dashboard. Reporting
 // only; the loop recomputes it from the readings rather than reading this back.
 int32_t lkaError = 0;
+
+// The extremes of the RAW error since the dashboard last asked.
+//
+// The value above is sampled twice a second and is written after the deadband
+// has already zeroed it, so a signal swinging between -190 and +190 reports as
+// a flat zero: the instrument cannot see the thing it is pointed at. These
+// three make a 2 Hz poll able to describe a 12 Hz loop, the same way
+// lineGapMaxMs lets it describe an 85 ms gap - the firmware remembers the
+// extremes and the browser collects them.
+//
+// Raw, before the deadband, on purpose. Recording the corrected value would
+// answer "did the controller act", which is already visible. The open question
+// is whether the signal underneath is quiet, and only the raw error answers it.
+//
+// The flag is what keeps a window with no samples in it from reporting the
+// previous window's numbers as though they were fresh.
+int32_t lkaErrorMin = 0;
+int32_t lkaErrorMax = 0;
+bool lkaErrorSeen = false;
 
 // Live so they can be tuned from the phone without a rebuild.
 //
@@ -1552,6 +1591,18 @@ static void updateLka() {
   // The measured lie is subtracted here and nowhere else. What is left is lean.
   int32_t error = diff - zeroPoint;
 
+  // Recorded here, above the deadband, because this is the last point at which
+  // the signal still exists. Two lines further down it has been rounded to zero
+  // and the evidence is gone.
+  if (!lkaErrorSeen) {
+    lkaErrorMin = error;
+    lkaErrorMax = error;
+    lkaErrorSeen = true;
+  } else {
+    lkaErrorMin = min(lkaErrorMin, error);
+    lkaErrorMax = max(lkaErrorMax, error);
+  }
+
   // Inside the lane neither sensor has reached a stripe and there is nothing to
   // correct - but a difference always has some value: noise, drift, the ADC.
   // Without this the rover would steer against its own measurement error the
@@ -1746,6 +1797,30 @@ static void handleData() {
   json += lkaKp;
   json += ",\"base\":";
   json += lkaBasePercent;
+
+  // How fast the controller above is actually being fed. Reported beside what
+  // it decided, because a correction and the age of the reading it was made
+  // from are one fact rather than two.
+  json += ",\"gapAvg\":";
+  json += lineAvgGapMs;
+  json += ",\"gapMax\":";
+  json += lineGapMaxMs;
+
+  // null rather than a number when the window held no samples, so an idle
+  // controller cannot be mistaken for a quiet signal. Same treatment the
+  // distance gets above, and for the same reason.
+  json += ",\"errMin\":";
+  json += (lkaErrorSeen ? String(lkaErrorMin) : String("null"));
+  json += ",\"errMax\":";
+  json += (lkaErrorSeen ? String(lkaErrorMax) : String("null"));
+
+  // ⚠️ The one place a handler clears state rather than only reporting it, and
+  // a deliberate exception to the rule stated above. Reset on read is what
+  // makes the window mean "since you last looked" instead of "since boot" - an
+  // instrument that never forgets would show one early spike for the rest of
+  // the run. It is safe here because nothing in the control path reads these:
+  // they are diagnostic only, and no motor decision depends on them.
+  lkaErrorSeen = false;
 
   json += "}";
 
@@ -2246,6 +2321,14 @@ void loop() {
 
     lastLineSummary = now;
     lineReadsInWindow = 0;
+
+    // Outside the log switch below on purpose. The dashboard is the only way
+    // to read this while the rover moves, and it must not depend on whether a
+    // serial report happens to be enabled. Guarded separately for the same
+    // divide by zero the printing guard covers.
+    if (reads > 0) {
+      lineAvgGapMs = elapsed / reads;
+    }
 
     // A window with no reads in it has no average to report and would divide by
     // zero working one out.

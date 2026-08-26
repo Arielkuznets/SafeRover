@@ -67,6 +67,9 @@ td:last-child{font-weight:bold;text-align:right}
 <tr><td>LKA</td><td id="la">...</td></tr>
 <tr><td>zero point</td><td id="zp">...</td></tr>
 <tr><td>error</td><td id="er">...</td></tr>
+<tr><td>err raw</td><td id="em">...</td></tr>
+<tr><td>gap avg</td><td id="ga">...</td></tr>
+<tr><td>gap max</td><td id="gm">...</td></tr>
 </table>
 
 <!-- Tuning. Kp is found by trial: raise it until the rover weaves, then come
@@ -137,6 +140,19 @@ async function poll() {
     document.getElementById('la').textContent = s.lkaActive ? 'steering' : 'off';
     document.getElementById('zp').textContent = s.zeroPoint;
     document.getElementById('er').textContent = s.lkaError;
+
+    // The row above is one sample of a signal that moves six times faster than
+    // this poll, and it is read after the deadband has flattened it. This one
+    // is the raw swing since the last poll, which is the number that says
+    // whether the signal underneath is actually quiet.
+    document.getElementById('em').textContent =
+      s.errMin === null ? '-- idle' : s.errMin + ' .. ' + s.errMax;
+
+    // How old the reading behind that error was. Read here rather than over
+    // serial because a cable would drag behind the rover and change the very
+    // timing it was brought along to measure.
+    document.getElementById('ga').textContent = s.gapAvg + ' ms';
+    document.getElementById('gm').textContent = s.gapMax + ' ms';
 
     // Filled from the rover once, then left alone. Writing them on every poll
     // would overwrite whatever is being typed, twice a second.
