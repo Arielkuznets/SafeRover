@@ -47,6 +47,13 @@ td:last-child{font-weight:bold;text-align:right}
 #right{grid-area:2/3}#back{grid-area:3/2}
 #stop{font-weight:bold}
 #speed{width:100%;height:2.5rem}
+
+/* Its own layout, not the direction pad's grid: these are fields to be read
+   and typed into, not targets to be hit without looking. */
+.tune{display:flex;flex-wrap:wrap;align-items:center;gap:.75rem;margin:1rem 0}
+.tune input{font-family:monospace;font-size:1.3rem;width:5rem}
+.tune button{font-family:monospace;font-size:1.3rem;padding:.3rem 1rem}
+#ts{font-size:1rem;opacity:.7}
 </style>
 </head>
 <body>
@@ -56,7 +63,22 @@ td:last-child{font-weight:bold;text-align:right}
 <tr><td>line L</td><td id="l">...</td></tr>
 <tr><td>line R</td><td id="r">...</td></tr>
 <tr><td>button</td><td id="b">...</td></tr>
+<tr><td>calibration</td><td id="cp">...</td></tr>
+<tr><td>LKA</td><td id="la">...</td></tr>
+<tr><td>zero point</td><td id="zp">...</td></tr>
+<tr><td>error</td><td id="er">...</td></tr>
 </table>
+
+<!-- Tuning. Kp is found by trial: raise it until the rover weaves, then come
+     back about a third. Doing that through a rebuild is two minutes a try and
+     the tuning never gets finished; from here it is seconds. Once the values
+     are settled they belong back in the firmware as the defaults. -->
+<div class="tune">
+<label>Kp <input type="number" id="kp" min="0" max="%KP_MAX%" step="1"></label>
+<label>base <input type="number" id="base" min="0" max="100" step="1"></label>
+<button id="apply">apply</button>
+<span id="ts"></span>
+</div>
 
 <div class="pad">
 <button id="fwd">&#94;</button>
@@ -71,6 +93,30 @@ td:last-child{font-weight:bold;text-align:right}
        min="%MIN_PERCENT%" max="100" value="%START_PERCENT%">
 
 <script>
+let tuningLoaded = false;
+
+// Sends whatever is in the two boxes. The rover refuses anything out of range
+// rather than clamping it, so a rejection is shown as one instead of being
+// quietly turned into a number nobody asked for.
+async function applyTuning() {
+  const body = 'kp=' + encodeURIComponent(document.getElementById('kp').value) +
+               '&base=' + encodeURIComponent(document.getElementById('base').value);
+
+  const status = document.getElementById('ts');
+
+  try {
+    const res = await fetch('/tune', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    });
+
+    status.textContent = res.ok ? 'set' : 'rejected';
+  } catch (e) {
+    status.textContent = 'no reply';
+  }
+}
+
 async function poll() {
   try {
     const s = await (await fetch('/data')).json();
@@ -86,6 +132,19 @@ async function poll() {
     document.getElementById('l').textContent = s.lineLeft;
     document.getElementById('r').textContent = s.lineRight;
     document.getElementById('b').textContent = s.button ? 'pressed' : 'released';
+
+    document.getElementById('cp').textContent = s.calPhase;
+    document.getElementById('la').textContent = s.lkaActive ? 'steering' : 'off';
+    document.getElementById('zp').textContent = s.zeroPoint;
+    document.getElementById('er').textContent = s.lkaError;
+
+    // Filled from the rover once, then left alone. Writing them on every poll
+    // would overwrite whatever is being typed, twice a second.
+    if (!tuningLoaded) {
+      document.getElementById('kp').value = s.kp;
+      document.getElementById('base').value = s.base;
+      tuningLoaded = true;
+    }
   } catch (e) {
     // One dropped poll is not worth blanking the screen for. The next one is
     // along shortly and will put the numbers back.
@@ -93,6 +152,8 @@ async function poll() {
 }
 
 setInterval(poll, %POLL_MS%);
+
+document.getElementById('apply').addEventListener('click', applyTuning);
 
 // Once immediately, so the page shows real values on load instead of the
 // placeholders sitting there until the first interval elapses.
@@ -123,8 +184,20 @@ speedEl.addEventListener('input', () => {
 // URLSearchParams builds dir=fwd&speed=47 and makes the browser set the
 // form-urlencoded content type, which is exactly what server.arg() on the rover
 // parses. Neither side needs any parsing code of its own.
-async function sendCommand() {
-  const body = new URLSearchParams({ dir: currentDir, speed: speedEl.value });
+//
+// The manual flag separates the two kinds of message this sends. A press is the
+// operator asking for something and carries it; the heartbeat below does not.
+// The rover uses that to know when to hand the lane keeping back - without it,
+// the heartbeat alone would switch the lane keeping off several times a second
+// for as long as this page was open.
+async function sendCommand(manual) {
+  const params = { dir: currentDir, speed: speedEl.value };
+
+  if (manual) {
+    params.manual = '1';
+  }
+
+  const body = new URLSearchParams(params);
 
   try {
     await fetch('/drive', { method: 'POST', body });
@@ -146,7 +219,7 @@ function hold(id, dir) {
 
   el.addEventListener('pointerdown', () => {
     currentDir = dir;
-    sendCommand();
+    sendCommand(true);
   });
 
   // Three ways a press can end, and only the first is the ordinary one.
@@ -157,7 +230,7 @@ function hold(id, dir) {
   ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => {
     el.addEventListener(ev, () => {
       currentDir = 'stop';
-      sendCommand();
+      sendCommand(true);
     });
   });
 }
@@ -170,7 +243,7 @@ hold('right', 'right');
 // Stop is not a held control. It is pressed, and it means stop.
 document.getElementById('stop').addEventListener('pointerdown', () => {
   currentDir = 'stop';
-  sendCommand();
+  sendCommand(true);
 });
 
 // The heartbeat, and only that. The presses above are what make the controls
@@ -178,7 +251,7 @@ document.getElementById('stop').addEventListener('pointerdown', () => {
 // thing the rover's watchdog is really measuring. It runs whether or not a
 // button is down, so a watchdog message means the page genuinely went away
 // rather than that somebody let go of a button.
-setInterval(sendCommand, %SEND_MS%);
+setInterval(() => sendCommand(false), %SEND_MS%);
 </script>
 </body>
 </html>

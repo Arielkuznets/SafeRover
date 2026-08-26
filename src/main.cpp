@@ -640,6 +640,103 @@ constexpr unsigned long CAL_SAMPLE_MS = 600;
 // Long enough not to fire on an ordinary press, short enough not to feel stuck.
 constexpr unsigned long CAL_BUTTON_LONG_MS = 800;
 
+// The largest resting difference a calibration will accept.
+//
+// Both sensors on the same white surface differ only by the mismatch between
+// the two parts - measured at 274 counts on this pair and 330 on the one before
+// it. One sensor sitting on a stripe puts that difference near 1800. This sits
+// between the two with room on both sides, so it catches a rover placed across
+// a stripe without refusing an honest offset.
+//
+// It compares a difference, not a level, so it does not move with the lighting.
+// That is the whole reason it can be a fixed number at all.
+constexpr int16_t CAL_MAX_RESTING_DIFF = 800;
+
+// The largest spread a sensor may show across the sampling window.
+//
+// A rover standing still on one surface wanders by a few tens of counts. One
+// being held, nudged, or still rocking produces hundreds. This is what stops a
+// zero point being averaged out of readings taken while the rover was moving -
+// a number that would look entirely reasonable and be wrong.
+constexpr uint16_t CAL_MAX_SPREAD = 250;
+
+// --- LKA ---
+// The far end of the error range the controller actually operates in.
+//
+// ⚠️ Not "one sensor fully over a stripe". That was the first reading of it,
+// and it was wrong by a factor of three. Fully over a stripe does measure
+// about 1850 - but the rover never gets there. It corrects as soon as a sensor
+// touches the edge of the tape, so the error was measured on the floor topping
+// out at 300-600. The divisor described a deflection the loop exists to
+// prevent, and every reading crowded into the bottom of the scale.
+//
+// The cost of that was not cosmetic. correction = Kp * error / this, so an
+// error of 400 against a divisor of 1800 produced 10 duty units out of 255 -
+// about 4% between the two sides, which on a 4WD chassis with no caster sits
+// right on the scrub friction and shakes instead of turning. Against 600 the
+// same error produces 30, and Kp gets a usable range back.
+//
+// ⚠️ Read that as what it is: lowering this constant RAISES the gain, and this
+// change tripled it. It is not a unit conversion.
+//
+// ⚠️ The original warning still holds and is the reason this stays hard to
+// misread. This does NOT compensate for anything. The differential measurement
+// cancels the common offset between rooms - the resting point moved 154 counts
+// where the raw readings moved 1295 - but it does not cancel the gain: the
+// swing itself still varies by about 20% with the lighting, so Kp stays mildly
+// illumination-dependent. Dividing by a constant cannot fix that, and reading
+// this line as if it did is the mistake it was written to prevent.
+constexpr int32_t LINE_DIFF_FULL_SCALE = 600;
+
+// Below this much error, nothing is corrected.
+//
+// The lane is 16 cm and the sensors sit 12.5 cm apart, so there is 1.75 cm of
+// travel on each side where neither sensor has reached a stripe. In the older
+// design that gap was free: both sensors read white and there was no signal at
+// all. A difference always has a value, so the gap has to be stated instead of
+// inherited - without it the rover would steer against its own noise.
+//
+// This is also what keeps the system lane keeping rather than lane centering.
+// It intervenes on approach to a marking; it does not hold the middle.
+constexpr int32_t LKA_DEADBAND = 200;
+
+// Starting values, both overwritable from the dashboard while tuning and both
+// meant to be replaced here once the tuning finds them.
+//
+// Kp is the duty difference applied between the two sides when a sensor is
+// fully over a stripe - that is the whole of its physical meaning. It starts
+// low because the way to find it is upwards: raise until the rover weaves, then
+// come back about a third.
+//
+// The base speed is the slowest the motors reliably start at, which is also the
+// most reaction time the controller can be given. It must be settled before Kp
+// is tuned, not after: the speed response is not linear - 1.6x the duty gives
+// 2.6x the speed - so a Kp found at one speed does not carry to another.
+constexpr uint8_t LKA_KP_DEFAULT = 15;
+constexpr uint8_t LKA_BASE_PERCENT_DEFAULT = DRIVE_MIN_PERCENT;
+
+// The largest Kp the dashboard will accept.
+//
+// Kp is a duty difference, and the duty only goes to PWM_MAX_DUTY, so past
+// this the correction saturates before the sensors do and the number stops
+// meaning anything. It is a guard against a typo in a text field on a phone,
+// not a tuning limit - a usable Kp will be far below it.
+constexpr uint8_t LKA_KP_MAX = 120;
+static_assert(LKA_KP_MAX <= PWM_MAX_DUTY,
+              "a Kp above full duty cannot reach the motors");
+
+// How far above its calibrated white a sensor has to read to count as being
+// over black.
+//
+// This guard is the one place the differential approach has to fall back on
+// absolute levels, because a difference cannot tell both sensors on white from
+// both on black - it is near zero either way, and the second case means the
+// rover has left the track entirely. There is no illumination-proof way to make
+// that distinction; it is the information a difference throws away. The margin
+// is therefore generous, and the fallback is that a calibration re-measures the
+// white it is compared against.
+constexpr uint16_t LKA_OFF_LANE_MARGIN = 900;
+
 // One value, not a flag per stage: with four booleans there is a state where
 // Warn and Stop are both set and something has to decide which wins. The order
 // is compared directly - larger is more severe - so keep it.
@@ -671,7 +768,12 @@ enum class StopMode : uint8_t { Coast, Brake };
 // until power is removed, which is the whole of how the result is stored. Idle
 // covers both "never calibrated" and "aborted" - to everything downstream those
 // are the same thing, because there is no zero point either way.
-enum class CalPhase : uint8_t { Idle, Settling, Sampling, Ready };
+//
+// Failed is kept apart from Idle although neither leaves a usable zero point,
+// because they answer different questions. Idle means nothing was attempted;
+// Failed means something was, and was refused. A calibration that quietly
+// produced no result would be indistinguishable from one never started.
+enum class CalPhase : uint8_t { Idle, Settling, Sampling, Ready, Failed };
 
 // Previous button reading, so the loop can report changes instead of flooding
 // the serial line on every pass while the button is held down.
@@ -762,6 +864,60 @@ uint16_t lineReadsInWindow = 0;
 // next calibration or the next power cycle.
 CalPhase calPhase = CalPhase::Idle;
 unsigned long calPhaseStartMs = 0;
+
+// What the last accepted calibration produced.
+//
+// zeroPoint is the difference the two sensors show over the same white, and it
+// is not zero: the two parts are not identical, so a rover sitting straight
+// still reads a few hundred counts of apparent lean. Measuring that lie once
+// and subtracting it forever is the entire purpose of the calibration.
+//
+// It is measured per session rather than written down as a constant because it
+// moves. The cancellation is good but not perfect - the same pair read 274 in
+// one room and 120 in another - and this project has already replaced both
+// sensors once, when the figure was 330.
+//
+// The two whites are kept for the off-lane guard alone. Nothing in the control
+// law reads them: a difference is what steers, and these exist only to answer
+// the one question a difference cannot, which is whether both sensors are on
+// black rather than both on white.
+int16_t zeroPoint = 0;
+uint16_t calLeftWhite = 0;
+uint16_t calRightWhite = 0;
+
+// Accumulated across the sampling window and divided at the end of it.
+//
+// The difference is summed as a signed total because it is normally negative,
+// and the two sides are summed separately because the guard needs each sensor's
+// own white rather than their average.
+int32_t calDiffSum = 0;
+uint32_t calLeftSum = 0;
+uint32_t calRightSum = 0;
+uint16_t calSampleCount = 0;
+
+// Whether the lane keeping is currently steering.
+//
+// Separate from calPhase because "calibrated but stopped" is a real state and a
+// useful one. Folding the two together would mean every stop threw the zero
+// point away and demanded a fresh calibration to start again.
+//
+// A real flag rather than something derived, because this one is not derivable:
+// it records an intention - drive, or do not - that no other state implies.
+bool lkaActive = false;
+
+// The last error the controller computed, kept for the dashboard. Reporting
+// only; the loop recomputes it from the readings rather than reading this back.
+int32_t lkaError = 0;
+
+// Live so they can be tuned from the phone without a rebuild.
+//
+// Kp tuning is dozens of trials: raise, drive, watch, adjust. Through a rebuild
+// that is two minutes a trial once the buzzer has been unplugged and plugged
+// back in, and the tuning simply does not get finished. Through the dashboard
+// it is seconds. Once the values are found they belong back in the constants
+// above, as defaults, rather than living only in a phone that gets closed.
+uint8_t lkaKp = LKA_KP_DEFAULT;
+uint8_t lkaBasePercent = LKA_BASE_PERCENT_DEFAULT;
 
 // What the operator has asked for, in the form drive() already takes: sign is
 // direction, magnitude is duty.
@@ -1186,21 +1342,22 @@ static void confirmWarnStage() {
 // Begins a calibration: clears what the last one left behind and starts the
 // settling window.
 //
-// The running accumulators are reset here rather than merely read at the end.
-// They hold whatever the sensors have seen since boot, which includes the rover
-// being carried, set down on a dark surface, or pushed across a stripe by hand.
-// Any one of those leaves an extreme behind that this measurement never saw.
+// Steering is switched off first. A calibration measures what the sensors read
+// while the rover is still, so it cannot be left running while the rover is
+// driving itself somewhere - the readings would describe the journey.
 //
-// lineGapMaxMs is cleared for the same reason: left alone it would still hold
-// the worst gap from before, and after a reset it describes the measurement
-// window alone.
+// The accumulators are cleared here rather than merely read at the end. They
+// hold whatever the sensors have seen since boot, which includes the rover
+// being carried, set down on a dark surface, or pushed across a stripe by hand.
 static void startCalibration() {
-  lineLeftMin = ADC_MAX_VALUE;
-  lineLeftMax = 0;
-  lineRightMin = ADC_MAX_VALUE;
-  lineRightMax = 0;
+  lkaActive = false;
 
   lineGapMaxMs = 0;
+
+  calDiffSum = 0;
+  calLeftSum = 0;
+  calRightSum = 0;
+  calSampleCount = 0;
 
   calPhase = CalPhase::Settling;
   calPhaseStartMs = millis();
@@ -1208,21 +1365,120 @@ static void startCalibration() {
   Serial.println("CAL  start");
 }
 
-// The one way out, taken by both the normal end and the button abort.
-//
-// Shared rather than written at each exit on purpose. There is little to undo
-// today, but every exit path having one place to do it is what kept the earlier
-// version honest, and the measurement that lands here next will have state of
-// its own to settle.
-//
-// Only a completed measurement leaves Ready behind. An aborted one has sampled
-// part of a window at best, and a partial average looks exactly like a real one
-// - a number in the right range, arrived at from too little. Idle says there is
-// no result, which is the truth.
-static void endCalibration(bool completed) {
-  calPhase = completed ? CalPhase::Ready : CalPhase::Idle;
+// The phase as a word, for the serial line and the dashboard. Matches
+// aebStageName: an enum printed as a number is a number nobody can read
+// without the header open beside them.
+static const char *calPhaseName(CalPhase phase) {
+  switch (phase) {
+  case CalPhase::Settling:
+    return "settling";
+  case CalPhase::Sampling:
+    return "sampling";
+  case CalPhase::Ready:
+    return "ready";
+  case CalPhase::Failed:
+    return "failed";
+  default:
+    return "idle";
+  }
+}
 
-  Serial.println(completed ? "CAL  done" : "CAL  aborted");
+// Adds one reading to the window. Called from the line read block once the
+// values have been taken, the same shape updateAebStage is called from the
+// distance block - nothing is measured here.
+static void accumulateCalibrationSample() {
+  if (calPhase != CalPhase::Sampling) {
+    return;
+  }
+
+  calDiffSum += static_cast<int32_t>(lineLeftValue) -
+                static_cast<int32_t>(lineRightValue);
+  calLeftSum += lineLeftValue;
+  calRightSum += lineRightValue;
+  calSampleCount++;
+}
+
+// Refuses the calibration and says why.
+//
+// Failed rather than Idle, and the reason printed rather than a bare refusal:
+// the two ways this goes wrong have entirely different fixes - the rover is
+// standing in the wrong place, or it was not standing still - and a rover that
+// merely declined to calibrate would leave which one to guesswork.
+static void failCalibration(const char *reason) {
+  calPhase = CalPhase::Failed;
+
+  Serial.print("CAL  failed: ");
+  Serial.println(reason);
+}
+
+// Turns the window into a zero point, or refuses it.
+//
+// Both checks read a difference or a spread and never a level, which is what
+// lets them be fixed numbers at all: levels move by more than a thousand counts
+// between rooms, and every guard this project built on one had to be thrown
+// away again.
+static void evaluateCalibration() {
+  if (calSampleCount == 0) {
+    failCalibration("no samples");
+    return;
+  }
+
+  const int16_t restingDiff = static_cast<int16_t>(calDiffSum / calSampleCount);
+  const uint16_t leftWhite = static_cast<uint16_t>(calLeftSum / calSampleCount);
+  const uint16_t rightWhite =
+      static_cast<uint16_t>(calRightSum / calSampleCount);
+
+  // Two sensors on the same white differ only by the mismatch between the
+  // parts. A difference far past that means one of them is over a stripe, and a
+  // zero point measured there teaches the rover that crooked is straight - it
+  // would then hold that error for the rest of the session.
+  if (abs(restingDiff) > CAL_MAX_RESTING_DIFF) {
+    failCalibration("one sensor is not on white");
+    return;
+  }
+
+  // A rover standing still wanders by tens of counts. Hundreds means it was
+  // held, nudged, or still rocking, and an average taken across that is a
+  // thoroughly reasonable-looking number describing nothing.
+  const uint16_t leftSpread = lineLeftMax - lineLeftMin;
+  const uint16_t rightSpread = lineRightMax - lineRightMin;
+
+  if (leftSpread > CAL_MAX_SPREAD || rightSpread > CAL_MAX_SPREAD) {
+    failCalibration("rover was not still");
+    return;
+  }
+
+  zeroPoint = restingDiff;
+  calLeftWhite = leftWhite;
+  calRightWhite = rightWhite;
+
+  calPhase = CalPhase::Ready;
+
+  // The rover drives itself from here, and that is worth knowing before the
+  // first time it happens: a button press, a second of stillness, and it
+  // leaves. Any press of that button stops it again.
+  lkaActive = true;
+
+  Serial.print("CAL  ok  zero=");
+  Serial.print(zeroPoint);
+  Serial.print("  white L=");
+  Serial.print(calLeftWhite);
+  Serial.print(" R=");
+  Serial.print(calRightWhite);
+  Serial.print("  spread L=");
+  Serial.print(leftSpread);
+  Serial.print(" R=");
+  Serial.print(rightSpread);
+  Serial.print("  samples=");
+  Serial.println(calSampleCount);
+}
+
+// Stops a calibration part way through. Idle rather than Failed: nothing was
+// judged here, the measurement was abandoned.
+static void abortCalibration() {
+  calPhase = CalPhase::Idle;
+
+  Serial.println("CAL  aborted");
 }
 
 // Steps the calibration, one loop pass at a time.
@@ -1232,10 +1488,6 @@ static void endCalibration(bool completed) {
 // the floor, and what replaced it needs no motion at all. The way a
 // non-blocking loop spends time is by comparing millis() against the moment the
 // phase began and returning, which is the shape the rest of the loop uses.
-//
-// It writes no motor command, so safeDrive and the AEB below it are untouched
-// by a calibration - there is no moment in this project where the rover drives
-// forward without them.
 static void updateCalibration() {
   if (!calibrationRunning()) {
     return;
@@ -1245,6 +1497,15 @@ static void updateCalibration() {
 
   if (calPhase == CalPhase::Settling) {
     if (now - calPhaseStartMs >= CAL_SETTLE_MS) {
+      // Cleared at this transition rather than at the start, because the spread
+      // has to describe the sampling window alone. Reset any earlier and it
+      // would carry the rocking that settling exists to wait out, and the
+      // stability check would refuse every honest calibration.
+      lineLeftMin = ADC_MAX_VALUE;
+      lineLeftMax = 0;
+      lineRightMin = ADC_MAX_VALUE;
+      lineRightMax = 0;
+
       calPhase = CalPhase::Sampling;
       calPhaseStartMs = now;
     }
@@ -1252,8 +1513,82 @@ static void updateCalibration() {
   }
 
   if (now - calPhaseStartMs >= CAL_SAMPLE_MS) {
-    endCalibration(true);
+    evaluateCalibration();
   }
+}
+
+// The lane keeping controller. Runs once a pass while it is active.
+//
+// It writes commandedLeft and commandedRight and stops there. It calls neither
+// drive nor safeDrive: this records intent exactly as a request handler does,
+// and the single write to the motors stays where it is, once a pass, after the
+// safety layer has had its say. The AEB can still slow or stop anything decided
+// here, and that ordering is the whole point of the seam built in phase 4.
+static void updateLka() {
+  if (!lkaActive) {
+    return;
+  }
+
+  // The one question a difference cannot answer.
+  //
+  // Both sensors on white and both on black look identical to a subtraction -
+  // near zero either way - and the second means the rover has left the track
+  // altogether. Levels are the only thing that separates them, so this is the
+  // single place absolute readings are used, with a margin wide enough to
+  // survive the lighting moving underneath it.
+  if (lineLeftValue > calLeftWhite + LKA_OFF_LANE_MARGIN &&
+      lineRightValue > calRightWhite + LKA_OFF_LANE_MARGIN) {
+    lkaActive = false;
+    commandedLeft = 0;
+    commandedRight = 0;
+
+    Serial.println("LKA  both sensors dark, off lane, stopped");
+    return;
+  }
+
+  const int32_t diff =
+      static_cast<int32_t>(lineLeftValue) - static_cast<int32_t>(lineRightValue);
+
+  // The measured lie is subtracted here and nowhere else. What is left is lean.
+  int32_t error = diff - zeroPoint;
+
+  // Inside the lane neither sensor has reached a stripe and there is nothing to
+  // correct - but a difference always has some value: noise, drift, the ADC.
+  // Without this the rover would steer against its own measurement error the
+  // whole way down a straight lane.
+  if (abs(error) < LKA_DEADBAND) {
+    error = 0;
+  }
+
+  lkaError = error;
+
+  // Kp is the duty difference between the two sides when a sensor is fully over
+  // a stripe. Dividing by the full scale is what gives it that meaning.
+  const int32_t correction =
+      (static_cast<int32_t>(lkaKp) * error) / LINE_DIFF_FULL_SCALE;
+
+  // Which side gets the extra, derived rather than guessed.
+  //
+  // High means dark on these sensors. Drifting left carries the left sensor
+  // towards the left stripe, so its reading rises, so left minus right rises,
+  // so the error is positive. Recovering means turning right, and a
+  // differential drive turns towards its slower side - so the right side loses
+  // speed and the left gains it.
+  //
+  // Confirm it on a stand before the wheels touch the floor. A reversed sign
+  // steers out of the lane instead of back into it, and from the driving seat
+  // that looks exactly like a badly chosen Kp.
+  const int32_t base = static_cast<int32_t>(dutyFromPercent(lkaBasePercent));
+  const int32_t limit = static_cast<int32_t>(PWM_MAX_DUTY);
+
+  commandedLeft =
+      static_cast<int16_t>(constrain(base + correction, -limit, limit));
+  commandedRight =
+      static_cast<int16_t>(constrain(base - correction, -limit, limit));
+
+  // A command source like any other, so it feeds the watchdog rather than being
+  // excused from it.
+  lastCommandMs = millis();
 }
 
 // Draws the status screen. Replaces the phase 2 test screen, which had proved
@@ -1364,6 +1699,7 @@ static void handleRoot() {
   page.replace("%SEND_MS%", String(COMMAND_SEND_INTERVAL_MS));
   page.replace("%MIN_PERCENT%", String(DRIVE_MIN_PERCENT));
   page.replace("%START_PERCENT%", String(DRIVE_START_PERCENT));
+  page.replace("%KP_MAX%", String(LKA_KP_MAX));
 
   server.send(200, "text/html", page);
 }
@@ -1393,6 +1729,24 @@ static void handleData() {
   json += lineRightValue;
   json += ",\"button\":";
   json += (lastButtonPressed ? "true" : "false");
+
+  // The lane keeping, reported rather than computed here. Everything below is
+  // read from state the loop already settled, for the same reason the readings
+  // above are: a handler that worked anything out would be letting a browser
+  // decide when it happened.
+  json += ",\"calPhase\":\"";
+  json += calPhaseName(calPhase);
+  json += "\",\"lkaActive\":";
+  json += (lkaActive ? "true" : "false");
+  json += ",\"zeroPoint\":";
+  json += zeroPoint;
+  json += ",\"lkaError\":";
+  json += lkaError;
+  json += ",\"kp\":";
+  json += lkaKp;
+  json += ",\"base\":";
+  json += lkaBasePercent;
+
   json += "}";
 
   server.send(200, "application/json", json);
@@ -1492,6 +1846,29 @@ static void handleDrive() {
   // Note what still does not happen here: nothing touches a motor. The loop
   // remains the only writer to the hardware, at a point of its own choosing,
   // which is where the AEB will intercept in phase 5.
+  // A deliberate press is the operator taking the wheel, so the lane keeping
+  // lets go. Real lane keeping disengages the same way and for the same reason:
+  // two things steering one vehicle is worse than either steering it alone.
+  //
+  // Without it the manual controls would look broken rather than overridden -
+  // the browser repeats its state and the controller rewrites it every pass, so
+  // the rover would answer to neither.
+  //
+  // ⚠️ Only a marked request counts, and the mark is what makes this workable.
+  // The page sends a heartbeat on a timer whether or not anything is being
+  // touched, deliberately, so that a watchdog message means the page went away
+  // rather than that somebody let go of a button. Treating that heartbeat as an
+  // instruction would disengage the lane keeping a few times a second for as
+  // long as a phone was connected, and the feature would never run at all.
+  //
+  // So the rover separates the channel saying "still here" from the operator
+  // saying "do this". Only the second takes the wheel.
+  if (lkaActive && server.hasArg("manual")) {
+    lkaActive = false;
+
+    Serial.println("LKA  released, manual command received");
+  }
+
   commandedLeft = left;
   commandedRight = right;
 
@@ -1529,10 +1906,86 @@ static void handleDrive() {
 // track whether it is listening, but that flag is protected and the class
 // exposes no accessor. The first request the browser makes is the real proof,
 // and the address printed below is how to make one.
+// Sets Kp and the base speed from the dashboard.
+//
+// Its own endpoint rather than more fields on /drive, because the two do
+// different things: /drive says where to go now, this says how the controller
+// should behave from now on. Mixing them would mean a tuning change arriving
+// through the path the watchdog watches.
+//
+// Both parameters are optional, so one can be changed without restating the
+// other.
+//
+// Out of range is refused, not clamped - the same rule /drive follows, and for
+// the same reason: toInt() answers 0 for anything it cannot parse, so a clamp
+// would silently turn a typo into a valid-looking setting. Better a rejection
+// the operator sees than a Kp of zero nobody ordered.
+//
+// Nothing here touches a motor, and nothing here recomputes a correction. The
+// values land in the variables the loop reads on its next pass.
+static void handleTune() {
+  bool changed = false;
+
+  if (server.hasArg("kp")) {
+    const long kp = server.arg("kp").toInt();
+
+    if (kp < 0 || kp > LKA_KP_MAX) {
+      server.send(400, "text/plain", "bad kp");
+      return;
+    }
+
+    lkaKp = static_cast<uint8_t>(kp);
+    changed = true;
+  }
+
+  if (server.hasArg("base")) {
+    const long base = server.arg("base").toInt();
+
+    // The floor is the duty the motors actually start turning at. Below it the
+    // rover would sit still while the dashboard showed it driving.
+    //
+    // Zero is allowed through as the one exception, and it is a bench setting
+    // rather than a driving one. With no base speed the two sides get nothing
+    // but the correction, in opposite directions, so a rover held off the
+    // ground shows the controller's output and nothing else.
+    //
+    // ⚠️ It only shows anything at a large Kp. The correction can never exceed
+    // Kp - at full deflection error/full scale is 1 - so a Kp of 15 asks for 15
+    // duty out of 255, which will not start a motor. The minimum above is a
+    // loaded, on-the-floor figure and a free wheel starts far below it, but not
+    // that far below. For a sign check, set Kp near its maximum, read which way
+    // the wheels go, and put it back. At an ordinary Kp use a real base speed
+    // and watch which side gains and which loses instead.
+    //
+    // On the floor this would turn on the spot rather than drive, which is
+    // useless but not dangerous - the AEB and the button both still apply.
+    if (base != 0 && (base < DRIVE_MIN_PERCENT || base > 100)) {
+      server.send(400, "text/plain", "bad base");
+      return;
+    }
+
+    lkaBasePercent = static_cast<uint8_t>(base);
+    changed = true;
+  }
+
+  if (!changed) {
+    server.send(400, "text/plain", "nothing to set");
+    return;
+  }
+
+  Serial.print("TUNE  kp=");
+  Serial.print(lkaKp);
+  Serial.print("  base=");
+  Serial.println(lkaBasePercent);
+
+  server.send(200, "text/plain", "ok");
+}
+
 static void startWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/data", HTTP_GET, handleData);
   server.on("/drive", HTTP_POST, handleDrive);
+  server.on("/tune", HTTP_POST, handleTune);
   server.begin();
 
   Serial.print("WEB SERVER up  http://");
@@ -1711,13 +2164,26 @@ void loop() {
       // keep the release that follows from acting a second time.
       const unsigned long held = now - buttonPressedAtMs;
 
+      // Three rules, and the first one is the safety rule: while anything is
+      // running, any press stops it. Not only a short press - a rover already
+      // moving across the floor is the worst moment to have to remember how
+      // long to hold a button for.
       if (calibrationRunning()) {
-        // Any release stops a running calibration, not only a short one. One
-        // button that always means "stop what you are doing" is worth more than
-        // a button that means two things depending on how long it was held.
-        endCalibration(false);
+        abortCalibration();
+      } else if (lkaActive) {
+        lkaActive = false;
+        commandedLeft = 0;
+        commandedRight = 0;
+
+        Serial.println("LKA  stopped by button");
       } else if (held >= CAL_BUTTON_LONG_MS) {
         startCalibration();
+      } else if (calPhase == CalPhase::Ready) {
+        // Short press with a zero point already measured: carry on driving. The
+        // measurement survived the stop, so there is nothing to redo.
+        lkaActive = true;
+
+        Serial.println("LKA  resumed");
       }
     }
   }
@@ -1749,13 +2215,18 @@ void loop() {
     lineLeftValue = readLineAveraged(PIN_LINE_SENSOR_LEFT);
     lineRightValue = readLineAveraged(PIN_LINE_SENSOR_RIGHT);
 
-    // Widened one reading at a time. Nothing here decides anything: this stage
-    // only establishes whether a span exists at all and how fast it can be
-    // sampled, which is what the calibration will later be built on.
+    // Widened one reading at a time. Built as a diagnostic, and now also what
+    // the calibration's stability check reads: a rover that was nudged while
+    // being measured shows it here as a spread of hundreds rather than tens.
     lineLeftMin = min(lineLeftMin, lineLeftValue);
     lineLeftMax = max(lineLeftMax, lineLeftValue);
     lineRightMin = min(lineRightMin, lineRightValue);
     lineRightMax = max(lineRightMax, lineRightValue);
+
+    // Inside the same block as the read, so the window counts readings and not
+    // loop passes - the same reason updateAebStage sits inside the distance
+    // block rather than beside it.
+    accumulateCalibrationSample();
   }
 
   // Reported on its own clock, slowly, for the reason given at
@@ -1866,6 +2337,11 @@ void loop() {
   // the following pass - which is the right way round: a browser and a
   // calibration both steering would be two things turning one rover.
   updateCalibration();
+
+  // After the calibration, so a measurement that just finished is steering on
+  // the same pass it completed rather than the next one. Before the watchdog
+  // and safeDrive, so what it writes is judged like any other command.
+  updateLka();
 
   if (!commandTimedOut && now - lastCommandMs >= COMMAND_TIMEOUT_MS) {
     commandedLeft = 0;
