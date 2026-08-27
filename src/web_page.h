@@ -79,8 +79,6 @@ td:last-child{font-weight:bold;text-align:right}
 <div class="tune">
 <label>Kp <input type="number" id="kp" min="0" max="%KP_MAX%" step="1"></label>
 <label>base <input type="number" id="base" min="0" max="100" step="1"></label>
-<label>filter <input type="number" id="filter" min="1" max="%FILTER_MAX%"
-                    step="1"></label>
 <button id="apply">apply</button>
 <span id="ts"></span>
 </div>
@@ -100,15 +98,12 @@ td:last-child{font-weight:bold;text-align:right}
 <script>
 let tuningLoaded = false;
 
-// Sends whatever is in the three boxes. The rover refuses anything out of range
+// Sends whatever is in the two boxes. The rover refuses anything out of range
 // rather than clamping it, so a rejection is shown as one instead of being
 // quietly turned into a number nobody asked for.
 async function applyTuning() {
-  const field = (id) => encodeURIComponent(document.getElementById(id).value);
-
-  const body = 'kp=' + field('kp') +
-               '&base=' + field('base') +
-               '&filter=' + field('filter');
+  const body = 'kp=' + encodeURIComponent(document.getElementById('kp').value) +
+               '&base=' + encodeURIComponent(document.getElementById('base').value);
 
   const status = document.getElementById('ts');
 
@@ -164,7 +159,6 @@ async function poll() {
     if (!tuningLoaded) {
       document.getElementById('kp').value = s.kp;
       document.getElementById('base').value = s.base;
-      document.getElementById('filter').value = s.filter;
       tuningLoaded = true;
     }
   } catch (e) {
