@@ -3,13 +3,16 @@
 A small autonomous rover that demonstrates two active automotive safety systems —
 **Autonomous Emergency Braking (AEB)** and **Lane Keeping Assist (LKA)** — on an ESP32.
 
-> 🚧 **Status:** In active development. **The rover brakes for obstacles on its own.**
-> AEB runs in three escalating stages with hysteresis, and it cannot be bypassed —
-> hold the forward button at a wall from the phone and the rover refuses, while
-> reverse and pivot turns stay free so it can always back out of what it stopped for.
-> Before that: driving from a phone over the rover's own Wi-Fi with a watchdog that
-> stops it when commands stop arriving, and every component wired and calibrated on
-> the vehicle. Next is LKA — the second safety system. See the [roadmap](#roadmap).
+> 🚧 **Status:** In active development. **Both safety systems now run on the floor —
+> the rover keeps its own lane and brakes for obstacles on its own.**
+> LKA steers from the *difference* between two infrared sensors, so it never has to
+> recognise black at all, and it holds a 25 cm lane. AEB runs in three escalating
+> stages with hysteresis, and it cannot be bypassed — hold the forward button at a
+> wall from the phone and the rover refuses, while reverse and pivot turns stay free
+> so it can always back out of what it stopped for. Before those: driving from a phone
+> over the rover's own Wi-Fi with a watchdog that stops it when commands stop
+> arriving, and every component wired and calibrated on the vehicle. Next is the state
+> machine that ties the modes together. See the [roadmap](#roadmap).
 
 SafeRover runs two independent closed control loops (sense → decide → act) on top of a
 real-time state machine.
@@ -58,10 +61,28 @@ Two decisions in it are worth more than the thresholds:
   reasoning is in the [journal](docs/journal.md).
 
 ### 🛣️ LKA — Lane Keeping Assist
-The rover runs inside a white lane marked by two black stripes, with one infrared sensor
-on each side. While it stays in the lane both sensors see white and nothing is corrected.
-A sensor reads dark only once the rover has drifted far enough to reach a stripe, and that
-is what a **proportional (P) controller** acts on to steer it back and to slow it in curves.
+The rover runs inside a **25 cm white lane** marked by two black stripes, with one
+infrared sensor on each side, **12.5 cm apart**. There is no line being followed — inside
+the lane both sensors read white, and there is 6.25 cm of travel on each side before
+either reaches a stripe.
+
+Steering comes from the **difference between the two readings**, never from either
+reading on its own. That distinction is the whole design. These sensors cannot tell their
+own infrared from the room's, so carrying the same track into a brighter room moves every
+reading: measured across two rooms, the absolute values shifted by about **1300 counts**
+while their difference shifted by **154**. A fixed brightness threshold calibrated in one
+room lands on black in the other. A difference does not.
+
+A button-triggered calibration measures the resting difference while the rover sits still
+on white and stores it as the zero point, which means **the system never has to see black
+at all**. A **proportional (P) controller** turns the deviation from that zero into a duty
+difference between the two sides — the rover turns toward its slower side — and a deadband
+holds it straight while neither sensor has reached a stripe.
+
+The lane width is not a free choice of layout. A lane narrower than the sideways travel of
+a single correction cannot be held at *any* gain: too little and the rover does not
+recover, too much and it is thrown onto the opposite stripe. The first track was 16 cm and
+did exactly that.
 
 Around the two safety systems: an on-board **OLED** status display, a **phone dashboard**
 with live telemetry and a brake-event log, a physical **mode button**, and every braking
@@ -115,7 +136,9 @@ the same side always turn the same way at the same speed, so they need no separa
 control. 4WD changes the wiring, not the code: `drive(left, right)` is unchanged.
 
 Because the chassis is 4WD with no caster, all four wheels scrub sideways through a
-turn. This is expected, and it will make tuning `Kp` in the LKA phase slower.
+turn. This was expected to make tuning `Kp` slow and twitchy. It was not what held the
+tuning up: the lane being narrower than a single correction was, and widening the track
+fixed what no value of `Kp` could.
 
 **Power.** Motors run from a 6×AA pack (~9 V); the ESP32 runs from a separate 5 V power
 bank; the two supplies share a common ground. Separating them prevents brownout resets
@@ -190,6 +213,13 @@ where to go had to change** when the braking arrived. Adding the seam afterwards
 have meant finding and converting every caller, and a single missed call would be a
 silent way around the brakes that no test would catch.
 
+Phase 6 collected the same debt from the other side. The lane keeping writes to the same
+two variables a phone command writes to, so it arrived without touching the braking layer
+at all — `updateLka()` never calls `drive()` or `safeDrive()`, it records an intention and
+lets the loop apply it. **The AEB can still slow or stop anything the lane keeping
+decides**, and that ordering is not a courtesy: it is the only route to the motors there
+is.
+
 ---
 
 ## Tech stack
@@ -249,7 +279,7 @@ pio run -e i2c-scanner -t upload
 | 3 | Vehicle moves — chassis, power, straight-line trim | ✅ |
 | 4 | Phone control — Wi-Fi dashboard + watchdog stop | ✅ |
 | 5 | AEB — 3-stage braking + hysteresis | ✅ |
-| 6 | LKA — track + P-controller tuning | ⬜ |
+| 6 | LKA — track + P-controller tuning | ✅ |
 | 7 | Brain — state machine + non-blocking loop | ⬜ |
 | 8 | IoT — live dashboard, NTP, cloud event log | ⬜ |
 | 9 | Finish — enclosure, portfolio, dry run | ⬜ |
