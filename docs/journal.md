@@ -2318,3 +2318,262 @@ known.
 
 ### Next up
 An on-vehicle status screen, and the README.
+
+---
+
+## Session 24 — 2026-08-26 — Lane keeping on the floor, and a fault the dashboard was creating
+
+### Goal
+Take the lane keeping from a build that compiles to a rover that holds a lane,
+and tune it against a real track.
+
+### What was done
+
+**The layer went on the floor for the first time.** Nothing in it had ever run
+on hardware before this session. The first runs were driven with the defaults
+that were in the code — Kp 15, base at `DRIVE_MIN_PERCENT` — and the rover
+juddered, dragged, and then released and drove forward, over and over.
+
+**With the base raised and the rover placed at an angle, it corrected back to
+straight.** That single run closed three questions at once: the sign is right,
+the sensors are on the pins the code thinks they are, and the loop closes. The
+straight-line runs before it had proved nothing, because a rover with the
+correction at zero drives straight for the same reason a rover with no
+controller does.
+
+**Two instruments were built during the session, because nothing else could see
+what was happening.** The first reports the interval the loop actually achieves
+between line reads. The second reports the range of the raw error between
+dashboard polls. Both are described under Decisions below.
+
+**A filter was built, measured, and disabled the same day.** It was written to
+remove noise from the error signal. It removed nothing, and that result is what
+established there was no noise to remove.
+
+**The real fault was found in the command watchdog** and is Fault 4 below. After
+it was fixed the rover ran well and consistently.
+
+**The track was widened from 16 cm of white to 25 cm.** This is Fault 3, and it
+is the change that made the difference between a rover that fought the lane and
+one that held it.
+
+### Problems & challenges
+
+**Fault 1 — the base speed sat on the stall floor**
+
+- **Symptom:** the rover shook, dragged, then broke free and drove forward,
+  repeating. Present from the first run.
+- **Diagnosis:** `LKA_BASE_PERCENT_DEFAULT` was `DRIVE_MIN_PERCENT`, and that
+  constant is not a slow speed — it is the duty at which the wheels stop
+  turning, measured on the floor in session 20. A base sitting on that floor
+  leaves no room underneath it, so every correction, however small, put the
+  slower side below the point at which its wheels pull. The side stalled, the
+  chassis dragged it sideways, and when the error fell back inside the deadband
+  the correction returned to zero, both sides returned to the same duty, and the
+  rover released.
+- **Solution:** the base was raised, and the default in the code was moved off
+  the floor. A `static_assert` now refuses a base that is not above
+  `DRIVE_MIN_PERCENT`.
+- **The AEB already carried this rule.** `AEB_SLOW_PERCENT` has an assert of
+  exactly the same shape, written in session 22 with the same reasoning. The
+  guard existed in one layer and was not carried to the other.
+- **A relationship worth keeping:** the usable range of Kp is bounded above by
+  the headroom the base leaves over the stall floor. At a base of
+  `DRIVE_MIN_PERCENT` that headroom is zero, which means no value of Kp could
+  have worked. It was never a tuning problem.
+
+**Fault 2 — the controller was fed five times a second**
+
+- **Symptom:** with the base fixed, the rover corrected, but slowly and in
+  visible steps rather than continuously.
+- **Diagnosis:** `LINE_READ_INTERVAL_MS` was 200. `updateLka` runs every pass,
+  but the readings it works from were refreshed five times a second, so between
+  refreshes it recomputed the same correction from the same numbers. At the
+  speed the rover drives that is about 13 cm of ground covered blind between one
+  observation and the next.
+- **The constant was correct for its previous job.** It was named
+  `LINE_PRINT_INTERVAL_MS` and set to a cadence suitable for a human reading a
+  serial log. When the reporting was given a clock of its own the name changed to
+  READ and the value did not follow. The same shape appears twice more in this
+  project: `ECHO_TIMEOUT_US` was derived from the module's datasheet range rather
+  than from the distance the AEB actually decides on, and the base speed in Fault
+  1 inherited a constant that measured something else entirely.
+- **Solution:** the interval was lowered to 20 ms, with the ceiling stated
+  openly in the comment. The loop cannot deliver 20 ms — `readEchoMedian` blocks
+  for up to 85 ms waiting out three ultrasonic timeouts, and does so precisely
+  when the road ahead is clear. Asking for less than the ceiling is deliberate:
+  it is what makes the reported figure the rate that was achieved rather than the
+  rate that was requested.
+- **A property that follows from this and is worth remembering:** the control
+  loop runs fastest when there is an obstacle ahead and slowest when the road is
+  clear, because an echo returns in milliseconds and nothing returns a full
+  timeout. The run log shows it — as the rover closed on an obstacle the measured
+  gap fell from 85 ms to 44 ms.
+
+**Fault 3 — the lane was narrower than one correction**
+
+- **Symptom:** with the base and the read rate both fixed, the rover still
+  fought the lane rather than settling in it.
+- **Diagnosis:** the lane was 16 cm of white and the sensors sit 12.5 cm apart,
+  leaving 1.75 cm of travel on each side before a sensor reaches a stripe. A
+  correction moves the rover sideways by more than that, so each correction
+  landed it on the opposite stripe and it bounced between the two.
+- **Solution:** the lane was widened to 25 cm, giving 6.25 cm of free travel a
+  side. The rover then held it.
+- **The general statement:** a lane narrower than the amplitude of one
+  correction cannot be held at any value of Kp — too little gain and it does not
+  recover, too much and it is thrown across. The width is bounded from below by
+  how far a single correction carries.
+- **This is the second instance of the same pattern in this project.** The
+  ultrasonic sensor's mounting height was recorded as calibration rather than a
+  mounting detail after a low mount let the beam reach the floor and return.
+  Lane width belongs in the same category: it is a calibrated parameter of the
+  control system, not a free choice of track layout.
+
+**Fault 4 — the watchdog fired on a command issued microseconds earlier**
+
+- **Symptom:** the rover crawled and juddered on plain white, where the
+  controller was doing nothing at all. Manual driving at the same duty, in the
+  same minute, was fast and smooth. The behaviour came and went between runs
+  with no setting changed.
+- **What the telemetry said.** A full run was logged once a second. The error
+  was zero in 27 of 30 driving samples, meaning both sides were being commanded
+  the same duty and no correction was being applied. The distance readings put
+  the rover at 3.9 cm/s against about 64 cm/s expected at that duty — a factor
+  of sixteen. Nothing in the lane keeping could produce that, because on those
+  samples the lane keeping was not acting.
+- **Diagnosis:** `now` is read once at the top of the loop pass. Every other
+  schedule in the loop compares it against a timestamp written as `= now`, which
+  therefore can never be newer than `now`, so a stale `now` only makes a check
+  fire slightly late. `lastCommandMs` is the single exception in the whole loop:
+  `updateLka` writes it from live `millis()`, several lines and one blocking
+  distance read further down the pass — up to 92 ms after `now` was taken. Both
+  are unsigned. `now - lastCommandMs`, with the larger value on the right, does
+  not go negative; it wraps to about 4.29 billion, which clears any timeout that
+  could be written. The watchdog then zeroed the commanded values and the motors
+  were cut.
+- **Why it was intermittent, and why it hid for so long.** `commandTimedOut`
+  latches after one firing and silences the check. Nothing clears it except a
+  valid driving request — which is what the dashboard's 120 ms heartbeat is. With
+  the page closed the watchdog fired once, latched, and the rover drove
+  correctly. With the page open the latch was cleared about eight times a second
+  and the motors were cut at the same rate.
+- **The instrument was the fault.** Every attempt to observe the problem
+  required the dashboard, and opening the dashboard is what caused it. The two
+  runs that behaved perfectly were the two run without it.
+- **Solution:** the watchdog reads `millis()` at the moment it asks. A safety
+  timer asks how long ago something happened and has to read the clock when it
+  asks, not remember what the clock said earlier in the pass.
+- **The rest of the loop was checked rather than assumed.** Every timestamp it
+  compares against `now` was listed and traced to its writer. All the others are
+  written `= now`; `lastCommandMs` is the only one written from a live clock, so
+  this is the only place the wrap can occur. `updateCalibration` looked like a
+  second instance and is not — it declares a `now` of its own from `millis()`
+  inside the function.
+- **Confirmed by prediction, not yet by the fix.** The mechanism predicts that
+  closing the dashboard makes the fault disappear, and it did, consistently. That
+  test removes more than the heartbeat, though — it also removes the web server
+  from the loop — so it is consistent with the diagnosis rather than decisive for
+  it. The decisive test is running the fixed firmware **with** the dashboard
+  open, and it has not been run. It costs nothing to run, because the next
+  ordinary run with the page open is the test.
+
+**Diagnoses that were tested and rejected**
+
+Five explanations were proposed for Fault 4 before the real one, and each was
+killed by a specific measurement rather than by argument. They are recorded
+because the method is the point.
+
+- **The chassis rocks and creates a false error.** The sensors change by about
+  270 counts per millimetre of height, and a moving rover rocks, so a millimetre
+  of difference between the two would leave the deadband. **Killed by** the raw
+  error instrument: each 500 ms window spanned 7 to 30 counts.
+- **The AEB is intervening.** Slow caps the duty and Stop brakes; both act
+  independently of the line, which would explain the juddering on white. **Killed
+  by** the distance column, which sat between 203 and 319 cm for the whole run
+  against a first threshold of 90.
+- **The motors stall near the floor.** **Killed by** driving manually at exactly
+  62 percent, which was smooth. The first version of this test was invalid: the
+  manual slider starts at 75, so it compared 75 percent manual against 62 percent
+  automatic and moved two variables at once.
+- **The noise is larger than the signal.** A filter was built for it. **Killed
+  by** the filter, which changed nothing — a moving average passes a sustained
+  signal and swallows a brief one, so no change means there was nothing brief.
+- **The batteries are flat.** The 3.9 cm/s figure fits a dying pack. **Killed
+  by** manual driving being fast in the same minute, on the same cells.
+
+**A measurement error worth recording separately.** The claim that the error
+signal spanned about 860 counts came from nine dashboard readings taken minutes
+apart. It was a slow trend read as scatter. A sparse sample cannot tell the two
+apart, and the whole filter was built on that reading.
+
+### Decisions & rationale
+
+**Two instruments, both reporting to the dashboard rather than to serial.** The
+rover runs untethered. A serial cable drags behind it and changes the timing
+being measured, and connecting one after a run resets the board and destroys the
+measurement. An instrument that disturbs what it measures is worth nothing.
+
+**Both work the same way: the firmware remembers the extremes between polls and
+the browser collects them.** The dashboard polls twice a second while the
+control loop runs at about twelve times a second, so a poll on its own sees one
+frame in six. The raw error range is recorded before the deadband, because the
+deadband zeroes exactly the signal the question is about. Both reset when read,
+so each poll describes the window since the last one rather than the whole run.
+The reset makes `handleData` the one request handler that clears state instead
+of only reporting it, which is a deliberate exception: nothing in the control
+path reads these values.
+
+**The filter was kept for one commit and then removed.** It is a legitimate
+mechanism and the measurement showed it is not needed here. It was also the only
+one of the three additions that sat in the control path, and at any length above
+1 it can only add delay to a controller that already reads its sensors late. It
+was committed before removal so that the reasoning has code to point at, the
+same way the calibration spin was in sessions 22 and 23.
+
+**`handleDrive` no longer writes the commanded values for an unmarked request
+while the lane keeping is steering.** The behaviour is unchanged today: the
+heartbeat's zeros were overwritten by `updateLka` before `safeDrive` read them,
+because `handleClient` runs at the end of the pass. That is an ordering and not
+a guarantee, and phase 7 rewrites the loop. The heartbeat still feeds the
+watchdog, which is the evidence it exists to collect.
+
+**`LINE_DIFF_FULL_SCALE` was lowered from 1800 to 600, and the justification is
+weak.** 1800 is a measured quantity — the difference when a sensor sits fully on
+a stripe, measured at 1833 and 1745 in session 7. 600 came from an observation
+that the error stopped around 400 in a run, and that run is now known to have
+been the one the watchdog was crippling, so the range it showed was
+artificially small. Only the ratio `Kp / LINE_DIFF_FULL_SCALE` affects
+behaviour, so the change was a threefold gain increase in the shape of a
+recalibration. It is left in place because the rover runs well with it, and it
+is recorded here as unvalidated.
+
+### Next up
+
+**Phase 6 is closed.** The lane keeping runs, holds a 25 cm lane consistently,
+and is not being reopened for further tuning. The layer does what it was built
+to do.
+
+Three loose ends are recorded rather than pursued. None of them blocks anything,
+each is cheap, and each becomes worth returning to only if the lane keeping
+misbehaves again.
+
+- **The watchdog fix has not been confirmed directly.** The mechanism was
+  verified in the source and its prediction held — closing the dashboard made
+  the fault disappear, consistently — but the fixed firmware has not been run
+  with the dashboard open, which is the test that isolates it. No test needs to
+  be arranged for this: the next ordinary run with the page open is the test.
+- **`err raw` should be re-read on a properly running rover.** The range it
+  showed was measured while the watchdog was cutting the motors, so the rover
+  never drove far enough off centre to develop a large deviation. If the error
+  now reaches considerably higher, `LINE_DIFF_FULL_SCALE` should return to the
+  measured 1800 with Kp scaled to match, which would restore the constant to a
+  quantity that can be pointed at rather than one taken from a crippled run.
+- **`LKA_DEADBAND` was never tuned.** It has held at 200 since it was written,
+  it was never the suspect in any of the four faults, and it caused no trouble
+  on the floor. It is left alone deliberately rather than by omission.
+
+Next is phase 7 — the state machine — which replaces `lkaActive` and the three
+button rules with STANDBY, MANUAL and AUTONOMOUS. It is also the reason
+`handleDrive` was hardened this session: that guard exists so the rewrite cannot
+reintroduce Fault 4 from a different direction.
