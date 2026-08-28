@@ -2287,11 +2287,34 @@ static void handleTune() {
   server.send(200, "text/plain", "ok");
 }
 
+// Takes a calibration without driving on it.
+//
+// The button lost its long press when it became a mode selector, and with it
+// went the only way to measure a zero point and read the number rather than
+// leave on it. That measurement is still wanted: the resting difference came
+// out -101 on one run and -314 on another with nothing touched between them,
+// and answering why needs repeated readings from a rover standing still.
+//
+// STANDBY only, and it does not change the mode. The result lands in calPhase
+// and zeroPoint where /data reports it; lkaSteering() asks for AUTO as well, so
+// nothing here can put a wheel in motion. Entering AUTO later starts its own
+// calibration and overwrites whatever this measured.
+static void handleCalibrate() {
+  if (mode != Mode::Standby) {
+    server.send(409, "text/plain", "standby only");
+    return;
+  }
+
+  startCalibration();
+  server.send(200, "text/plain", "ok");
+}
+
 static void startWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/data", HTTP_GET, handleData);
   server.on("/drive", HTTP_POST, handleDrive);
   server.on("/tune", HTTP_POST, handleTune);
+  server.on("/calibrate", HTTP_POST, handleCalibrate);
   server.begin();
 
   Serial.print("WEB SERVER up  http://");
