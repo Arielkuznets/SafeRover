@@ -106,7 +106,7 @@ constexpr uint8_t PIN_MOTOR_ENB = 14; // right side speed
 //   span white->black  L 1833    R 1745
 //
 // Two separate uncertainties, and the larger is the one to design against. Each
-// printed reading is already an average of 16 samples; successive readings, 200
+// reading is already an average of 16 samples; successive readings, 200
 // ms apart with nothing touched, repeat to about +/-5 counts. Between separate
 // measurements the value drifts by up to 65.
 //
@@ -281,9 +281,8 @@ constexpr uint32_t PWM_MAX_DUTY =
 // --- Timing ---
 // The rate the line sensors are read at.
 //
-// Named READ rather than PRINT because the two are no longer the same thing:
-// the reading runs on this clock, the reporting on one of its own below. They
-// were a single rate until the reporting had to be slowed down independently.
+// Named READ because that is all it does. The averaging window below runs on a
+// clock of its own; the two were a single rate until they had to be separated.
 //
 // The value did not follow the rename, and for the whole of the first LKA run
 // the controller steered on data 200 ms old - about 13 cm of ground at the
@@ -297,12 +296,12 @@ constexpr uint32_t PWM_MAX_DUTY =
 // ACHIEVED rather than the rate that was requested.
 constexpr unsigned long LINE_READ_INTERVAL_MS = 20;
 
-// How often the accumulated span and timing are reported.
+// The window the achieved read rate is averaged over.
 //
-// Deliberately slower than the read, so that reporting stays off the critical
-// path. Serial.print blocks once the transmit buffer fills, and an instrument
-// that disturbs what it measures is worth nothing - the timing figures below
-// are measured in milliseconds, which is the range a blocked write lands in.
+// It is not a reporting rate. The loop counts reads inside a window this long
+// and divides at the end of it, which is what turns a count into the average
+// interval the dashboard shows. Long enough that one slow pass does not
+// dominate it, short enough to follow the rover changing what it is doing.
 constexpr unsigned long LINE_SUMMARY_INTERVAL_MS = 500;
 
 // How often the screen is asked whether anything it shows has changed. The ask
@@ -331,30 +330,15 @@ constexpr unsigned long BUZZER_TEST_MS = 300;
 // still get through while the bounce does not.
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 50;
 
-// --- Serial ---
-constexpr unsigned long SERIAL_BAUD = 115200;
-
-// One switch per repeating report, rather than a single verbose flag.
+// ⚠️ There is no serial output in this firmware and no Serial.begin(). It was
+// removed once every fault it reported had somewhere better to appear: the mode
+// on the screen and the status LED, the AEB on the dashboard, a refused
+// calibration on the dashboard with its reason, and the buzzer for anything the
+// operator has to hear while looking at the floor.
 //
-// The single flag was written when the line sensors were the only thing being
-// watched, and it stopped fitting as soon as more than one subsystem was
-// printing. At any moment one of them is under test and the rest are noise, and
-// a single boolean cannot say which one. With the driving commands added there
-// are four repeating reports running at once - roughly twenty-four lines a
-// second - and reading any one of them meant reading all of them.
-//
-// Only the printing is suppressed. Every task still runs at its own rate, so
-// the loop timing stays representative of the real thing.
-//
-// Events are deliberately absent from this list and are never silenced: a
-// rejected command, the watchdog firing, a failed init, the addresses reported
-// at boot. Those are not reports that repeat, they are things that happened.
-constexpr bool LOG_BUTTON = false;
-// On for the calibration work: the line summary is the entire output of this
-// stage, which measures rather than acts.
-constexpr bool LOG_LINE = true;
-constexpr bool LOG_DISTANCE = false;
-constexpr bool LOG_DRIVE = true;
+// It was never readable during a run anyway. The rover is untethered, a cable
+// drags behind it and changes the timing being measured, and plugging one in
+// afterwards resets the board and takes the measurement with it.
 
 // --- Wi-Fi access point ---
 // The rover creates its own network instead of joining an existing one. A
@@ -391,8 +375,7 @@ constexpr bool WIFI_AP_HIDDEN = false;
 // --- Web server ---
 // Port 80 is the one a browser assumes when none is given, so the address is
 // the plain IP with nothing after it. Named rather than left as a literal
-// because it also appears in the URL printed at boot, and the two must not
-// drift apart.
+// so that the one place it is written down is here.
 constexpr uint16_t WEB_SERVER_PORT = 80;
 
 // How often the browser asks for fresh numbers. Half a second is quick enough
@@ -815,8 +798,8 @@ enum class CalPhase : uint8_t { Idle, Settling, Sampling, Ready, Failed };
 // three, inside safeDrive, and nothing in this enum can switch it off.
 enum class Mode : uint8_t { Standby, Manual, Auto };
 
-// Previous button reading, so the loop can report changes instead of flooding
-// the serial line on every pass while the button is held down.
+// Previous button reading, so the loop acts on the edge rather than on every
+// pass a finger is down - one press has to mean one mode change.
 bool lastButtonPressed = false;
 unsigned long lastButtonChange = 0;
 
@@ -901,10 +884,8 @@ uint16_t lineReadsInWindow = 0;
 // The average interval over the last summary window, kept for the dashboard.
 //
 // The maximum above is a worst case and can be a single bad pass; this is what
-// the controller experiences most of the time. Stored rather than only printed
-// because the rover runs untethered - serial needs a cable, the cable drags
-// behind the rover and changes the physics being measured, and plugging one in
-// afterwards resets the board and takes the measurement with it.
+// the controller experiences most of the time. It reaches the dashboard, which
+// is the only instrument that can read it while the rover moves.
 unsigned long lineAvgGapMs = 0;
 
 // Where the calibration has got to, and when the current phase began. Idle
@@ -913,6 +894,18 @@ unsigned long lineAvgGapMs = 0;
 // AUTO, which discards it.
 CalPhase calPhase = CalPhase::Idle;
 unsigned long calPhaseStartMs = 0;
+
+// ⚠️ Why the last calibration was refused, for the dashboard.
+//
+// Failed on its own says a measurement was rejected; it does not say which of
+// the two things went wrong, and they have opposite fixes - the rover is
+// standing in the wrong place, or it was not standing still. Guessing between
+// them is exactly the loop this has to prevent.
+//
+// A pointer to a literal rather than a String. The strings are compile-time
+// constants that outlive every caller, so there is nothing to copy and nothing
+// to free.
+const char *calFailReason = "";
 
 // What the last accepted calibration produced.
 //
@@ -1073,7 +1066,7 @@ static bool alertSounding() {
   return alertRaised && (millis() - alertStartMs < ALERT_BEEP_MS);
 }
 
-// The mode as a word, for the screen, the serial line and the dashboard.
+// The mode as a word, for the screen and the dashboard.
 static const char *modeName(Mode m) {
   switch (m) {
   case Mode::Manual:
@@ -1366,8 +1359,8 @@ static float distanceFromDuration(unsigned long durationUs) {
   return (durationUs * SOUND_SPEED_CM_PER_US) / 2.0f;
 }
 
-// Names the stage for the log. All four listed rather than a default, so a
-// stage added later warns here instead of printing as something else.
+// Names the stage for the dashboard. All four listed rather than a default, so
+// a stage added later warns here instead of arriving as something else.
 static const char *aebStageName(AebStage stage) {
   switch (stage) {
   case AebStage::Clear:
@@ -1387,9 +1380,6 @@ static const char *aebStageName(AebStage stage) {
 // second. It decides and reports and does nothing else - enforcement belongs
 // inside safeDrive, where no caller can route around it.
 static void updateAebStage() {
-  const AebStage previous = aebStage;
-  float distanceCm = 0.0f;
-
   if (echoDurationValue == 0) {
     aebMissedReads++;
 
@@ -1415,7 +1405,11 @@ static void updateAebStage() {
         (aebLastValidCm <= AEB_WARN_CM) ? AebStage::Stop : AebStage::Clear;
   } else {
     aebMissedReads = 0;
-    distanceCm = distanceFromDuration(echoDurationValue);
+
+    // Scoped to this branch: the other one has no distance to speak of, and a
+    // variable declared above both would have to be given a placeholder value
+    // that means nothing.
+    const float distanceCm = distanceFromDuration(echoDurationValue);
     aebLastValidCm = distanceCm;
 
     AebStage byDistance = AebStage::Clear;
@@ -1457,25 +1451,6 @@ static void updateAebStage() {
     }
   }
 
-  // Transitions only, and behind no log switch: this is an event, like the
-  // watchdog message. The distance goes with it because that is what a
-  // calibration run compares against a ruler.
-  if (aebStage != previous) {
-    Serial.print("AEB  ");
-    Serial.print(aebStageName(previous));
-    Serial.print(" -> ");
-    Serial.print(aebStageName(aebStage));
-
-    if (echoDurationValue == 0) {
-      Serial.print("  no echo, last ");
-      Serial.print(aebLastValidCm, 1);
-      Serial.println(" cm");
-    } else {
-      Serial.print("  at ");
-      Serial.print(distanceCm, 1);
-      Serial.println(" cm");
-    }
-  }
 }
 
 // Counts how long Warn has held. Kept out of updateAebStage so the stage
@@ -1507,6 +1482,10 @@ static void confirmWarnStage() {
 // hold whatever the sensors have seen since boot, which includes the rover
 // being carried, set down on a dark surface, or pushed across a stripe by hand.
 static void startCalibration() {
+  // Cleared here, not at the failure, so a refusal stays readable for as long
+  // as it is the last thing that happened.
+  calFailReason = "";
+
   lineGapMaxMs = 0;
 
   calDiffSum = 0;
@@ -1517,12 +1496,10 @@ static void startCalibration() {
   calPhase = CalPhase::Settling;
   calPhaseStartMs = millis();
 
-  Serial.println("CAL  start");
 }
 
-// The phase as a word, for the serial line and the dashboard. Matches
-// aebStageName: an enum printed as a number is a number nobody can read
-// without the header open beside them.
+// The phase as a word, for the dashboard. Matches aebStageName: an enum sent as
+// a number is a number nobody can read without the header open beside them.
 static const char *calPhaseName(CalPhase phase) {
   switch (phase) {
   case CalPhase::Settling:
@@ -1555,15 +1532,14 @@ static void accumulateCalibrationSample() {
 
 // Refuses the calibration and says why.
 //
-// Failed rather than Idle, and the reason printed rather than a bare refusal:
-// the two ways this goes wrong have entirely different fixes - the rover is
-// standing in the wrong place, or it was not standing still - and a rover that
-// merely declined to calibrate would leave which one to guesswork.
+// Failed rather than Idle, and the reason kept rather than a bare refusal: the
+// two ways this goes wrong have entirely different fixes - the rover is standing
+// in the wrong place, or it was not standing still - and a rover that merely
+// declined to calibrate would leave which one to guesswork. calFailReason is
+// what carries that to the dashboard.
 static void failCalibration(const char *reason) {
   calPhase = CalPhase::Failed;
-
-  Serial.print("CAL  failed: ");
-  Serial.println(reason);
+  calFailReason = reason;
 }
 
 // Turns the window into a zero point, or refuses it.
@@ -1611,18 +1587,6 @@ static void evaluateCalibration() {
   // becomes movement is lkaSteering()'s question, and only AUTO answers yes.
   calPhase = CalPhase::Ready;
 
-  Serial.print("CAL  ok  zero=");
-  Serial.print(zeroPoint);
-  Serial.print("  white L=");
-  Serial.print(calLeftWhite);
-  Serial.print(" R=");
-  Serial.print(calRightWhite);
-  Serial.print("  spread L=");
-  Serial.print(leftSpread);
-  Serial.print(" R=");
-  Serial.print(rightSpread);
-  Serial.print("  samples=");
-  Serial.println(calSampleCount);
 }
 
 // Stops a calibration part way through. Idle rather than Failed: nothing was
@@ -1630,7 +1594,6 @@ static void evaluateCalibration() {
 static void abortCalibration() {
   calPhase = CalPhase::Idle;
 
-  Serial.println("CAL  aborted");
 }
 
 // ⚠️ The only writer of mode. Exit work and entry work both happen here, so a
@@ -1684,8 +1647,6 @@ static void enterMode(Mode next) {
 
   screenDirty = true;
 
-  Serial.print("MODE  ");
-  Serial.println(modeName(next));
 }
 
 // Steps the calibration, one loop pass at a time.
@@ -1765,7 +1726,6 @@ static void updateLka() {
   // survive the lighting moving underneath it.
   if (lineLeftValue > calLeftWhite + LKA_OFF_LANE_MARGIN &&
       lineRightValue > calRightWhite + LKA_OFF_LANE_MARGIN) {
-    Serial.println("LKA  both sensors dark, off lane, stopped");
 
     // A full transition, not a flag being lowered. That is what discards the
     // zero point, which the old version left behind: the rover has demonstrably
@@ -1919,26 +1879,13 @@ static void startAccessPoint() {
   // network to join yet and would spend its time scanning for one.
   WiFi.mode(WIFI_AP);
 
-  // Kept rather than only reported. The screen has to be able to say whether
-  // the network came up, and after setup() returns there is nothing else left
-  // in the firmware that knows.
+  // ⚠️ Kept, not just acted on. The screen is the only thing that can now say
+  // whether the network came up, and after setup() returns nothing else in the
+  // firmware knows. A failure is not fatal either: a rover that stops dead
+  // because a radio did not come up is worse than one that still drives without
+  // it, so this reports through apUp and returns either way.
   apUp = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL,
                      WIFI_AP_HIDDEN, WIFI_AP_MAX_CLIENTS);
-
-  // Deliberately behind no log switch. These print once at boot, and the
-  // address is the only way to know what to point a browser at.
-  if (!apUp) {
-    // Reported and then let go, the same as the display above: a rover that
-    // stops dead because a radio did not come up is worse than one that still
-    // drives without it.
-    Serial.println("WIFI AP FAILED - rover continues without it");
-    return;
-  }
-
-  Serial.print("WIFI AP up  SSID=");
-  Serial.println(WIFI_AP_SSID);
-  Serial.print("WIFI AP IP  ");
-  Serial.println(WiFi.softAPIP());
 }
 
 // Serves the page. PAGE_HTML is const and cannot be edited where it sits, so it
@@ -1966,8 +1913,8 @@ static void handleRoot() {
 //
 // A missing echo is sent as null and never as a number. The browser has to be
 // able to tell no reading from zero centimetres, because a zero would describe
-// an obstacle pressed against the sensor - the same distinction the serial
-// output makes when it prints "d=--  no echo", from the same source value.
+// an obstacle pressed against the sensor - the most dangerous misreading this
+// page could produce.
 //
 // Neither handler measures anything. Both read what the loop last stored.
 static void handleData() {
@@ -1994,6 +1941,8 @@ static void handleData() {
   json += modeName(mode);
   json += "\",\"calPhase\":\"";
   json += calPhaseName(calPhase);
+  json += "\",\"calReason\":\"";
+  json += calFailReason;
   json += "\",\"lkaActive\":";
   json += (lkaSteering() ? "true" : "false");
   json += ",\"zeroPoint\":";
@@ -2082,8 +2031,6 @@ static void handleDrive() {
     // could fold an absurd value back inside the valid range and let it
     // through.
     if (percent < DRIVE_MIN_PERCENT || percent > 100) {
-      Serial.print("DRIVE  rejected, speed=");
-      Serial.println(speedArg);
 
       server.send(400, "text/plain", "bad speed");
       return;
@@ -2113,8 +2060,6 @@ static void handleDrive() {
       left = magnitude;
       right = -magnitude;
     } else {
-      Serial.print("DRIVE  rejected, dir=");
-      Serial.println(dir);
 
       server.send(400, "text/plain", "bad dir");
       return;
@@ -2181,19 +2126,6 @@ static void handleDrive() {
   lastCommandMs = millis();
   commandTimedOut = false;
 
-  // Behind a switch because a held button produces about eight of these a
-  // second, which is a repeating report. The two rejections above are not:
-  // those are events, and they print whatever the switches say, like the
-  // watchdog.
-  if (LOG_DRIVE) {
-    Serial.print("DRIVE  dir=");
-    Serial.print(dir);
-    Serial.print("  L=");
-    Serial.print(left);
-    Serial.print("  R=");
-    Serial.println(right);
-  }
-
   server.send(200, "text/plain", "ok");
 }
 
@@ -2210,8 +2142,8 @@ static void handleDrive() {
 // Nothing here reports failure, and saying so is more honest than an if that
 // always passes. WebServer::begin() returns void. The socket underneath does
 // track whether it is listening, but that flag is protected and the class
-// exposes no accessor. The first request the browser makes is the real proof,
-// and the address printed below is how to make one.
+// exposes no accessor. The first request the browser makes is the real proof.
+
 // Sets Kp and the base speed from the dashboard.
 //
 // Its own endpoint rather than more fields on /drive, because the two do
@@ -2279,11 +2211,6 @@ static void handleTune() {
     return;
   }
 
-  Serial.print("TUNE  kp=");
-  Serial.print(lkaKp);
-  Serial.print("  base=");
-  Serial.println(lkaBasePercent);
-
   server.send(200, "text/plain", "ok");
 }
 
@@ -2316,32 +2243,25 @@ static void startWebServer() {
   server.on("/tune", HTTP_POST, handleTune);
   server.on("/calibrate", HTTP_POST, handleCalibrate);
   server.begin();
-
-  Serial.print("WEB SERVER up  http://");
-  Serial.print(WiFi.softAPIP());
-  Serial.println("/");
 }
 
 void setup() {
   // First, before anything else: the buzzer sounds while its pin is undriven,
   // so every instruction that runs before this one is an instruction spent
-  // making noise. Serial.begin() alone is long enough to hear.
+  // making noise.
   //
-  // The order is forced by the core and cannot be inverted. A write to a pin
+  // ⚠️ The order is forced by the core and cannot be inverted. A write to a pin
   // that has not been configured yet is dropped rather than queued: the
   // peripheral manager does not recognise the pin, gpio_set_level is never
   // reached, and the call only logs an error. Setting the latch ahead of
   // pinMode is an AVR habit, and here it silently did nothing - the pin stayed
-  // at the sounding level through the whole of setup, and the boot log said so
-  // on every reset.
+  // at the sounding level through the whole of setup.
   //
   // So the pin passes through its default low, which is the level that sounds,
   // for the microseconds between these two lines. That is as short as the
   // window gets.
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, BUZZER_SILENT);
-
-  Serial.begin(SERIAL_BAUD);
 
   // Binding the channel explicitly rather than letting the core pick one, so
   // the allocation stays predictable once the motor channels are added.
@@ -2423,17 +2343,11 @@ void setup() {
   // run; the loop puts it up on its first pass either way.
   displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false);
 
-  if (!displayReady) {
-    Serial.println("OLED buffer allocation FAILED - out of RAM");
-  }
-
   startAccessPoint();
   startWebServer();
 
   // No initial write to either warning output. safeDrive sets both on every
   // pass, so the first one happens within a millisecond of the loop starting.
-  Serial.print("SafeRover boot OK - AEB brake light on GPIO ");
-  Serial.println(PIN_BRAKE_LIGHT);
 
   // A power-on self test, and a permanent one. It began as a way to prove the
   // buzzer worked at all, and the reason to keep it arrived later: its VCC is
@@ -2447,12 +2361,6 @@ void setup() {
   // delay() is allowed here. The rule against it applies to the main loop,
   // where blocking means the sensors stop being read; setup() runs once before
   // that loop starts and holds nothing up.
-  // Ungated, like the other lines printed at boot: it fires once and it is what
-  // explains the noise that follows it.
-  Serial.print("BUZZER TEST  ");
-  Serial.print(BUZZER_TEST_MS);
-  Serial.println(" ms beep on GPIO 4");
-
   digitalWrite(PIN_BUZZER, BUZZER_SOUND);
   delay(BUZZER_TEST_MS);
   digitalWrite(PIN_BUZZER, BUZZER_SILENT);
@@ -2480,10 +2388,6 @@ void loop() {
     lastButtonChange = now;
     lastButtonPressed = buttonPressed;
 
-    if (LOG_BUTTON) {
-      Serial.println(buttonPressed ? "BUTTON PRESSED" : "BUTTON RELEASED");
-    }
-
     // One gesture, one meaning: advance the cycle. Acted on the press rather
     // than the release, because there is no longer a length to measure and a
     // control that answers on the way down feels immediate.
@@ -2497,8 +2401,8 @@ void loop() {
     }
   }
 
-  // Data collection only: read and accumulate. No thresholds, no decisions, and
-  // no printing - the summary below reports on a clock of its own.
+  // Data collection only: read and accumulate. No thresholds and no decisions -
+  // the averaging window below runs on a clock of its own.
   if (now - lastLineRead >= LINE_READ_INTERVAL_MS) {
     // Taken before the timestamp is overwritten, because the useful number is
     // the distance between two runs that actually happened rather than the one
@@ -2538,9 +2442,8 @@ void loop() {
     accumulateCalibrationSample();
   }
 
-  // Reported on its own clock, slowly, for the reason given at
-  // LINE_SUMMARY_INTERVAL_MS: printing per read would block on the serial
-  // buffer and stretch the interval being measured.
+  // Averaged over its own window rather than per read, for the reason given at
+  // LINE_SUMMARY_INTERVAL_MS.
   //
   // The first window is discarded rather than reported. It starts at the zero
   // the timestamp was initialised to and therefore spans the whole of setup(),
@@ -2556,42 +2459,10 @@ void loop() {
     lastLineSummary = now;
     lineReadsInWindow = 0;
 
-    // Outside the log switch below on purpose. The dashboard is the only way
-    // to read this while the rover moves, and it must not depend on whether a
-    // serial report happens to be enabled. Guarded separately for the same
-    // divide by zero the printing guard covers.
+    // A window with no reads in it has no average, and working one out would
+    // divide by zero.
     if (reads > 0) {
       lineAvgGapMs = elapsed / reads;
-    }
-
-    // A window with no reads in it has no average to report and would divide by
-    // zero working one out.
-    if (LOG_LINE && reads > 0) {
-      Serial.print("LINE  L=");
-      Serial.print(lineLeftValue);
-      Serial.print(" [");
-      Serial.print(lineLeftMin);
-      Serial.print("..");
-      Serial.print(lineLeftMax);
-      Serial.print(" span ");
-      Serial.print(lineLeftMax - lineLeftMin);
-      Serial.print("]  R=");
-      Serial.print(lineRightValue);
-      Serial.print(" [");
-      Serial.print(lineRightMin);
-      Serial.print("..");
-      Serial.print(lineRightMax);
-      Serial.print(" span ");
-      Serial.print(lineRightMax - lineRightMin);
-      Serial.print("]  reads=");
-      Serial.print(reads);
-      Serial.print(" asked=");
-      Serial.print(LINE_READ_INTERVAL_MS);
-      Serial.print("ms avg=");
-      Serial.print(elapsed / reads);
-      Serial.print("ms max=");
-      Serial.print(lineGapMaxMs);
-      Serial.println("ms");
     }
   }
 
@@ -2603,26 +2474,12 @@ void loop() {
   if (now - lastDistanceRead >= DISTANCE_READ_INTERVAL_MS) {
     lastDistanceRead = now;
 
-    // Both values get printed: the pulse says whether a bad number came from
-    // the sensor or from the conversion below it.
+    // ⚠️ Stored as the raw pulse, not as a distance, and zero keeps the meaning
+    // it carries everywhere else in this file: no echo came back. Converting it
+    // would produce 0.0 cm, which reads exactly like an obstacle pressed
+    // against the sensor - the most dangerous misreading available to anything
+    // that works the brakes.
     echoDurationValue = readEchoMedian();
-
-    if (LOG_DISTANCE) {
-      Serial.print("DIST  echo=");
-      Serial.print(echoDurationValue);
-      Serial.print("us  ");
-
-      // A timeout is not a distance. Converting the 0 would print 0.0 cm, which
-      // reads exactly like an obstacle pressed against the sensor — the most
-      // dangerous possible misreading once this drives the brakes.
-      if (echoDurationValue == 0) {
-        Serial.println("d=--  no echo");
-      } else {
-        Serial.print("d=");
-        Serial.print(distanceFromDuration(echoDurationValue), 1);
-        Serial.println("cm");
-      }
-    }
 
     // Inside the same block as the read, so the stage is only reconsidered when
     // there is something new to reconsider it from - and so the Warn counter
@@ -2643,8 +2500,7 @@ void loop() {
 
   // The watchdog. Silence is read as a stop, and the flag guards the condition
   // rather than letting it fire on every pass once the deadline is past: after
-  // the values are zeroed there is nothing left to zero. Behind no log switch,
-  // because this is an event rather than a repeating report.
+  // the values are zeroed there is nothing left to zero.
   //
   // ⚠️ millis() here, NOT the loop's cached now, and this is not cosmetic - the
   // line read `now` for a day and the rover was unusable. now is taken once at
@@ -2675,7 +2531,6 @@ void loop() {
     commandedRight = 0;
     commandTimedOut = true;
 
-    Serial.println("WATCHDOG  no command within timeout, motors stopped");
   }
 
   // ⚠️ A command may stand only while a source entitled to give it exists, and

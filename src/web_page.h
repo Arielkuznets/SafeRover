@@ -174,6 +174,8 @@ details[open] summary{margin-bottom:.7rem}
     <span>AEB stage</span><b id="ae">--</b>
     <span>lane keeping</span><b id="la">--</b>
     <span>calibration</span><b id="cp">--</b>
+    <span id="crk" style="display:none">refused because</span>
+    <b id="cr" style="display:none"></b>
     <span>zero point</span><b id="zp">--</b>
     <span>error</span><b id="er">--</b>
     <span>line L / R</span><b id="lr">--</b>
@@ -260,6 +262,15 @@ async function poll() {
     $('ae').textContent = s.aeb;
     $('la').textContent = s.lkaActive ? 'steering' : 'off';
     $('cp').textContent = s.calPhase;
+
+    // The firmware prints nothing, so this is the only place a refusal says
+    // which of the two things went wrong - and they have opposite fixes. Both
+    // cells are hidden when there is nothing to explain: the grid has no row
+    // element to hide, so the label and the value are hidden as a pair.
+    $('cr').textContent = s.calReason;
+    const showReason = s.calReason ? '' : 'none';
+    $('crk').style.display = showReason;
+    $('cr').style.display = showReason;
     $('zp').textContent = s.zeroPoint;
     $('er').textContent = s.lkaError;
     $('lr').textContent = s.lineLeft + ' / ' + s.lineRight;
