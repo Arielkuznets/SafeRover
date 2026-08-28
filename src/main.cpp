@@ -647,9 +647,10 @@ constexpr unsigned long CAL_SETTLE_MS = 200;
 // away again anyway.
 constexpr unsigned long CAL_SAMPLE_MS = 600;
 
-// How long the button has to be held for the release to start a calibration.
-// Long enough not to fire on an ordinary press, short enough not to feel stuck.
-constexpr unsigned long CAL_BUTTON_LONG_MS = 800;
+// How long the buzzer sounds for something that is not the AEB - a refused
+// calibration, or the lane keeping giving up. Long enough to be unmistakable,
+// short enough not to be taken for a fault of its own.
+constexpr unsigned long ALERT_BEEP_MS = 600;
 
 // The largest resting difference a calibration will accept.
 //
@@ -787,28 +788,37 @@ enum class StopMode : uint8_t { Coast, Brake };
 // button and possibly of the rover. Readings taken during that are readings of
 // someone's grip.
 //
-// Ready is not a moment, it is a condition that lasts: it says a zero point has
-// been measured and is worth using. It holds until the next calibration or
-// until power is removed, which is the whole of how the result is stored. Idle
-// covers both "never calibrated" and "aborted" - to everything downstream those
-// are the same thing, because there is no zero point either way.
+// Ready says a zero point has been measured and is worth using. Idle covers
+// both "never calibrated" and "aborted" - downstream those are the same thing,
+// because there is no zero point either way.
 //
-// Failed is kept apart from Idle although neither leaves a usable zero point,
-// because they answer different questions. Idle means nothing was attempted;
-// Failed means something was, and was refused. A calibration that quietly
-// produced no result would be indistinguishable from one never started.
+// Failed is kept apart from Idle although neither leaves a usable zero point:
+// Idle means nothing was attempted, Failed means something was and was refused.
+// A calibration that quietly produced no result would be indistinguishable from
+// one never started.
+//
+// ⚠️ Ready used to last until the next calibration or the next power cycle, and
+// this file used to argue for that - "calibrated but stopped" was called a real
+// state worth keeping. Phase 7 reversed it: every exit from AUTO discards the
+// zero point. What changed the decision was a measurement, not an opinion. The
+// resting difference came out -101 on one calibration and -314 on another with
+// nothing in the mounting touched between them, a spread of 213 counts against
+// a deadband of 200. A zero point that moves that much while the rover stands
+// still cannot be trusted to survive the rover being driven somewhere else.
 enum class CalPhase : uint8_t { Idle, Settling, Sampling, Ready, Failed };
+
+// Who is driving. Exactly one source at a time, which is the whole point: the
+// question "what happens when the phone and the lane keeping both command"
+// stops having an answer because it stops being reachable.
+//
+// The AEB is deliberately not here. It is a layer, not a mode - it runs in all
+// three, inside safeDrive, and nothing in this enum can switch it off.
+enum class Mode : uint8_t { Standby, Manual, Auto };
 
 // Previous button reading, so the loop can report changes instead of flooding
 // the serial line on every pass while the button is held down.
 bool lastButtonPressed = false;
 unsigned long lastButtonChange = 0;
-
-// When the current press began, so its length can be measured at the release.
-// The existing block already fires on debounced transitions and nowhere else,
-// so holding one timestamp is the whole of what a long press needs - no new
-// test on every pass while the finger is down.
-unsigned long buttonPressedAtMs = 0;
 
 unsigned long lastLineRead = 0;
 unsigned long lastLineSummary = 0;
@@ -833,6 +843,11 @@ bool apUp = false;
 // happening to differ from zero.
 constexpr uint8_t DISPLAY_STATIONS_UNKNOWN = 0xFF;
 uint8_t lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
+
+// Raised by anything that changes what the screen should say but is not the
+// station count - which since phase 7 means the mode. Starts true so the first
+// pass draws.
+bool screenDirty = true;
 
 // The last readings the loop took, held at file scope so a request handler can
 // report them without measuring anything itself.
@@ -893,8 +908,9 @@ uint16_t lineReadsInWindow = 0;
 unsigned long lineAvgGapMs = 0;
 
 // Where the calibration has got to, and when the current phase began. Idle
-// until a long press starts one; Ready from the end of a measurement until the
-// next calibration or the next power cycle.
+// until entering AUTO starts one, or until the dashboard asks for a
+// measurement; Ready from the end of an accepted one until the rover leaves
+// AUTO, which discards it.
 CalPhase calPhase = CalPhase::Idle;
 unsigned long calPhaseStartMs = 0;
 
@@ -928,15 +944,15 @@ uint32_t calLeftSum = 0;
 uint32_t calRightSum = 0;
 uint16_t calSampleCount = 0;
 
-// Whether the lane keeping is currently steering.
+// Who is driving. enterMode() is the only thing that writes it.
 //
-// Separate from calPhase because "calibrated but stopped" is a real state and a
-// useful one. Folding the two together would mean every stop threw the zero
-// point away and demanded a fresh calibration to start again.
+// ⚠️ This replaced a bool called lkaActive, which was defended here as "a real
+// flag rather than something derived, because it records an intention that no
+// other state implies". The mode now implies it, so the flag's own reasoning
+// says to delete it - see lkaSteering() below.
 //
-// A real flag rather than something derived, because this one is not derivable:
-// it records an intention - drive, or do not - that no other state implies.
-bool lkaActive = false;
+// Standby at boot by decision, not by a zero happening to mean stopped.
+Mode mode = Mode::Standby;
 
 // The last error the controller computed, kept for the dashboard. Reporting
 // only; the loop recomputes it from the readings rather than reading this back.
@@ -1001,6 +1017,12 @@ uint8_t aebWarnReads = 0;
 // threshold, which is the assumption made before any reading exists: open road.
 float aebLastValidCm = AEB_WARN_CM + 1.0f;
 
+// A reason to sound the buzzer that is not the AEB: a refused calibration, or
+// the lane keeping stopping itself. Held as a start time rather than a deadline
+// so the comparison stays now - start and cannot wrap.
+unsigned long alertStartMs = 0;
+bool alertRaised = false;
+
 // Percentages are the readable unit; the hardware wants raw counts.
 static uint32_t dutyFromPercent(uint8_t percent) {
   return (static_cast<uint32_t>(percent) * PWM_MAX_DUTY) / 100;
@@ -1032,6 +1054,69 @@ static bool calibrationRunning() {
   return calPhase == CalPhase::Settling || calPhase == CalPhase::Sampling;
 }
 
+// Starts the non-AEB beep. It cannot write the pin itself: applyAebOutputs sets
+// the buzzer on every pass, so anything written here would be gone within a
+// millisecond. It raises a condition that applyAebOutputs reads instead.
+static void startAlert() {
+  alertStartMs = millis();
+  alertRaised = true;
+}
+
+static bool alertSounding() {
+  return alertRaised && (millis() - alertStartMs < ALERT_BEEP_MS);
+}
+
+// The mode as a word, for the screen, the serial line and the dashboard.
+static const char *modeName(Mode m) {
+  switch (m) {
+  case Mode::Manual:
+    return "MANUAL";
+  case Mode::Auto:
+    return "AUTO";
+  default:
+    return "STANDBY";
+  }
+}
+
+// The button's whole vocabulary. One gesture, one cycle - the long press that
+// used to start a calibration is gone, because under phase 7 the calibration
+// belongs to the AUTO transition and a hand-started one could not survive to be
+// driven on.
+static Mode nextMode(Mode current) {
+  switch (current) {
+  case Mode::Standby:
+    return Mode::Manual;
+  case Mode::Manual:
+    return Mode::Auto;
+  default:
+    return Mode::Standby;
+  }
+}
+
+// Whether the lane keeping is steering right now. Derived rather than stored,
+// which is what let the old lkaActive flag be deleted: AUTO says the operator
+// asked for it, Ready says there is a zero point to do it with, and neither can
+// be left behind by a path that forgot to clear it.
+//
+// It is false for the whole of the entry calibration - the phase is Settling or
+// Sampling then, not Ready - so the rover stands still while it measures.
+static bool lkaSteering() {
+  return mode == Mode::Auto && calPhase == CalPhase::Ready;
+}
+
+// ⚠️ Whether anyone is entitled to be commanding the motors at all.
+//
+// A command may stand only while a source that issued it exists. In STANDBY
+// there is none; in AUTO there is none until the calibration finishes, and none
+// again once the lane keeping gives up. Zeroing on this one condition closes
+// three separate holes that each used to depend on something else remembering:
+// a heartbeat driving a parked rover, a held button driving the rover through
+// its own calibration, and a stale command left standing after the lane keeping
+// stopped.
+static bool commandSourceActive() {
+  return mode == Mode::Manual || lkaSteering();
+}
+
 static void applyAebOutputs(bool movingForward, AebStage stage) {
   // Warn has to have held for a while; the two stages that act on the motors
   // announce themselves the moment they are entered.
@@ -1042,7 +1127,11 @@ static void applyAebOutputs(bool movingForward, AebStage stage) {
   const bool braking =
       movingForward && (stage == AebStage::Slow || stage == AebStage::Stop);
 
-  digitalWrite(PIN_BUZZER, sounding ? BUZZER_SOUND : BUZZER_SILENT);
+  // The buzzer has two owners now. Either can sound it; only both being quiet
+  // silences it.
+  const bool buzzing = sounding || alertSounding();
+
+  digitalWrite(PIN_BUZZER, buzzing ? BUZZER_SOUND : BUZZER_SILENT);
   ledcWrite(PIN_BRAKE_LIGHT, braking ? PWM_MAX_DUTY : 0);
 }
 
@@ -1394,16 +1483,15 @@ static void confirmWarnStage() {
 // Begins a calibration: clears what the last one left behind and starts the
 // settling window.
 //
-// Steering is switched off first. A calibration measures what the sensors read
-// while the rover is still, so it cannot be left running while the rover is
-// driving itself somewhere - the readings would describe the journey.
+// Nothing switches steering off here any more. Setting the phase away from
+// Ready is what stops it, because lkaSteering() is derived from that phase -
+// the rover cannot drive itself through its own measurement by construction
+// rather than by this function remembering to prevent it.
 //
 // The accumulators are cleared here rather than merely read at the end. They
 // hold whatever the sensors have seen since boot, which includes the rover
 // being carried, set down on a dark surface, or pushed across a stripe by hand.
 static void startCalibration() {
-  lkaActive = false;
-
   lineGapMaxMs = 0;
 
   calDiffSum = 0;
@@ -1504,12 +1592,9 @@ static void evaluateCalibration() {
   calLeftWhite = leftWhite;
   calRightWhite = rightWhite;
 
+  // Nothing here decides to drive. Ready is a measurement result; whether it
+  // becomes movement is lkaSteering()'s question, and only AUTO answers yes.
   calPhase = CalPhase::Ready;
-
-  // The rover drives itself from here, and that is worth knowing before the
-  // first time it happens: a button press, a second of stillness, and it
-  // leaves. Any press of that button stops it again.
-  lkaActive = true;
 
   Serial.print("CAL  ok  zero=");
   Serial.print(zeroPoint);
@@ -1531,6 +1616,61 @@ static void abortCalibration() {
   calPhase = CalPhase::Idle;
 
   Serial.println("CAL  aborted");
+}
+
+// ⚠️ The only writer of mode. Exit work and entry work both happen here, so a
+// transition cannot half-happen somewhere else - which is the whole reason this
+// phase exists rather than more flags.
+static void enterMode(Mode next) {
+  if (next == mode) {
+    return;
+  }
+
+  // A measurement in progress belongs to the mode it was started in, whichever
+  // that was: readings taken while the rover is being driven somewhere else
+  // describe the journey.
+  //
+  // Leaving AUTO also throws away a finished zero point. The rover cannot know
+  // how far it was driven or how the light moved since, and a fresh measurement
+  // costs 800 ms. What decided that is a measurement, recorded at the CalPhase
+  // declaration.
+  //
+  // ⚠️ A refusal survives on purpose - the reason is the whole of what Failed
+  // carries and the operator has not read it yet. Nothing can be driven on it
+  // either way, because lkaSteering() asks for Ready.
+  if (calibrationRunning()) {
+    abortCalibration();
+  } else if (mode == Mode::Auto && calPhase != CalPhase::Failed) {
+    calPhase = CalPhase::Idle;
+  }
+
+  mode = next;
+
+  // commandSourceActive() would zero these on the next pass anyway. Doing it
+  // here means no mode ever begins holding an order given to a different one.
+  commandedLeft = 0;
+  commandedRight = 0;
+
+  // No operator command has arrived in this session yet, and recording that is
+  // more honest than carrying a timestamp from one that has ended. Without it
+  // the watchdog fires on the first pass and reports a timeout nobody caused.
+  if (next == Mode::Manual) {
+    commandTimedOut = true;
+  }
+
+  // The operator asked to drive itself; measuring is the first half of that.
+  if (next == Mode::Auto) {
+    startCalibration();
+  }
+
+  // Lit for anything that can move, which is the one question a single lamp
+  // answers well.
+  digitalWrite(PIN_STATUS_LED, next == Mode::Standby ? LOW : HIGH);
+
+  screenDirty = true;
+
+  Serial.print("MODE  ");
+  Serial.println(modeName(next));
 }
 
 // Steps the calibration, one loop pass at a time.
@@ -1566,6 +1706,26 @@ static void updateCalibration() {
 
   if (now - calPhaseStartMs >= CAL_SAMPLE_MS) {
     evaluateCalibration();
+
+    // A refused calibration must not be mistakable for a button press that did
+    // not register - the operator would press again and fail again, learning
+    // nothing. The buzzer says it happened, the phase says why, and the drop to
+    // STANDBY is what makes the rover safe while both are read.
+    //
+    // Done here rather than inside failCalibration so that function stays a
+    // report, and so it does not have to call something declared after it.
+    //
+    // The beep is unconditional; only the drop to STANDBY is not. A refusal is
+    // worth announcing whether it came from the AUTO transition or from the
+    // dashboard's measure-only button, and in the second case there is no mode
+    // to leave.
+    if (calPhase == CalPhase::Failed) {
+      startAlert();
+
+      if (mode == Mode::Auto) {
+        enterMode(Mode::Standby);
+      }
+    }
   }
 }
 
@@ -1577,7 +1737,7 @@ static void updateCalibration() {
 // safety layer has had its say. The AEB can still slow or stop anything decided
 // here, and that ordering is the whole point of the seam built in phase 4.
 static void updateLka() {
-  if (!lkaActive) {
+  if (!lkaSteering()) {
     return;
   }
 
@@ -1590,11 +1750,18 @@ static void updateLka() {
   // survive the lighting moving underneath it.
   if (lineLeftValue > calLeftWhite + LKA_OFF_LANE_MARGIN &&
       lineRightValue > calRightWhite + LKA_OFF_LANE_MARGIN) {
-    lkaActive = false;
-    commandedLeft = 0;
-    commandedRight = 0;
-
     Serial.println("LKA  both sensors dark, off lane, stopped");
+
+    // A full transition, not a flag being lowered. That is what discards the
+    // zero point, which the old version left behind: the rover has demonstrably
+    // left the lane, so the measurement it was steering by is describing a
+    // place it is no longer in.
+    //
+    // It sounds, because a rover that stopped itself somewhere unexpected is
+    // exactly the event an operator watching the floor rather than the phone
+    // needs to be told about.
+    startAlert();
+    enterMode(Mode::Standby);
     return;
   }
 
@@ -1650,9 +1817,11 @@ static void updateLka() {
   commandedRight =
       static_cast<int16_t>(constrain(base - correction, -limit, limit));
 
-  // A command source like any other, so it feeds the watchdog rather than being
-  // excused from it.
-  lastCommandMs = millis();
+  // ⚠️ This used to end with lastCommandMs = millis(), which kept the watchdog
+  // permanently fed and was the only reason it never fired in autonomous
+  // driving. That was an accident of the controller looking like a command
+  // source, not a rule. The watchdog is now gated on MANUAL where it is stated
+  // outright, and nothing here touches it.
 }
 
 // Draws the status screen. Replaces the phase 2 test screen, which had proved
@@ -1677,8 +1846,14 @@ static void showStatusScreen(uint8_t stations) {
   display.setTextSize(1);
   display.setTextColor(FOREGROUND);
 
+  // Title and mode share the top line. A 128x32 panel holds three lines of this
+  // font and the address and the phone status already take the other two - and
+  // of the three facts, which mode the rover is in is the one worth reading
+  // from across the room.
   display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP);
   display.print(SCREEN_TITLE);
+  display.print(' ');
+  display.print(modeName(mode));
 
   display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP + OLED_LINE_SPACING);
 
@@ -1697,8 +1872,9 @@ static void showStatusScreen(uint8_t stations) {
 }
 
 // Redraws only when what the screen says has actually changed. The address is
-// fixed once setup() is over and the failure line cannot change at all, so the
-// station count is the only thing left that moves.
+// fixed once setup() is over and the failure line cannot change at all, so two
+// things move: the station count, polled here, and the mode, which raises
+// screenDirty at the transition rather than being compared for.
 static void updateStatusScreen() {
   // A failed begin() means there is no buffer to draw into. Reported at boot
   // and then left alone: the rover drives perfectly well without a screen.
@@ -1707,10 +1883,11 @@ static void updateStatusScreen() {
   }
 
   const uint8_t stations = WiFi.softAPgetStationNum();
-  if (stations == lastDrawnStations) {
+  if (!screenDirty && stations == lastDrawnStations) {
     return;
   }
 
+  screenDirty = false;
   lastDrawnStations = stations;
   showStatusScreen(stations);
 }
@@ -1798,10 +1975,12 @@ static void handleData() {
   // read from state the loop already settled, for the same reason the readings
   // above are: a handler that worked anything out would be letting a browser
   // decide when it happened.
-  json += ",\"calPhase\":\"";
+  json += ",\"mode\":\"";
+  json += modeName(mode);
+  json += "\",\"calPhase\":\"";
   json += calPhaseName(calPhase);
   json += "\",\"lkaActive\":";
-  json += (lkaActive ? "true" : "false");
+  json += (lkaSteering() ? "true" : "false");
   json += ",\"zeroPoint\":";
   json += zeroPoint;
   json += ",\"lkaError\":";
@@ -1934,47 +2113,38 @@ static void handleDrive() {
   // Note what still does not happen here: nothing touches a motor. The loop
   // remains the only writer to the hardware, at a point of its own choosing,
   // which is where the AEB will intercept in phase 5.
-  // A deliberate press is the operator taking the wheel, so the lane keeping
-  // lets go. Real lane keeping disengages the same way and for the same reason:
-  // two things steering one vehicle is worse than either steering it alone.
-  //
-  // Without it the manual controls would look broken rather than overridden -
-  // the browser repeats its state and the controller rewrites it every pass, so
-  // the rover would answer to neither.
+  // A deliberate press is the operator taking the wheel, from any mode. Real
+  // lane keeping disengages the same way and for the same reason: two things
+  // steering one vehicle is worse than either steering it alone.
   //
   // ⚠️ Only a marked request counts, and the mark is what makes this workable.
   // The page sends a heartbeat on a timer whether or not anything is being
   // touched, deliberately, so that a watchdog message means the page went away
   // rather than that somebody let go of a button. Treating that heartbeat as an
-  // instruction would disengage the lane keeping a few times a second for as
-  // long as a phone was connected, and the feature would never run at all.
+  // instruction would drag the rover out of STANDBY the moment a phone
+  // connected, and out of AUTO several times a second after that.
   //
   // So the rover separates the channel saying "still here" from the operator
-  // saying "do this". Only the second takes the wheel.
-  if (lkaActive && server.hasArg("manual")) {
-    lkaActive = false;
-
-    Serial.println("LKA  released, manual command received");
+  // saying "do this", by origin and never by content. That is also why the STOP
+  // button still stops an autonomous rover: it is a press, so it is marked, so
+  // it takes the wheel - even though what it asks for is a stop.
+  if (server.hasArg("manual")) {
+    enterMode(Mode::Manual);
   }
 
-  // ⚠️ A heartbeat feeds the watchdog but must not write a command, and this
-  // guard is what keeps that true independently of where handleClient sits in
-  // the loop.
+  // ⚠️ Only MANUAL accepts a driving command, and this holds independently of
+  // where handleClient sits in the loop.
   //
   // The page repeats its state on a timer whether or not anything is touched,
-  // so while the lane keeping steers, an unmarked request arrives about eight
-  // times a second carrying dir=stop. Writing that through has been harmless
-  // only because handleClient runs at the end of the pass and updateLka puts
-  // the values back before safeDrive reads them - an ordering, not a
-  // guarantee. Phase 7 rewrites this loop, and moving handleClient ahead of
-  // safeDrive would turn these two lines into a rover that loses its motors
-  // eight times a second: the exact fault this project has already spent a day
-  // chasing once, arriving from somewhere else.
+  // so an unmarked request arrives about eight times a second. In AUTO it would
+  // overwrite the controller's steering; in STANDBY it would move a rover
+  // nobody asked to move. Writing it through used to be harmless only because
+  // handleClient runs at the end of the pass and updateLka put the values back
+  // before safeDrive read them - an ordering, not a guarantee.
   //
-  // The condition repeats what the block above already settled. That is
-  // deliberate - it states the rule here rather than inheriting it from a
-  // branch ten lines up that a later edit could reasonably change.
-  if (!lkaActive || server.hasArg("manual")) {
+  // The condition restates what the block above settled rather than inheriting
+  // it, so a later edit to that branch cannot silently open this one.
+  if (mode == Mode::Manual) {
     commandedLeft = left;
     commandedRight = right;
   }
@@ -2130,10 +2300,11 @@ void setup() {
   ledcAttachChannel(PIN_BRAKE_LIGHT, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS,
                     PWM_CHANNEL_BRAKE);
 
-  // Lit for as long as the board is powered, so it also shows at a glance
-  // that the firmware actually reached setup().
+  // Dark, because the rover boots into STANDBY and from phase 7 this lamp means
+  // one thing: whether the rover is in a mode that can move. Proof that the
+  // firmware reached setup() comes from the boot beep and the screen instead.
   pinMode(PIN_STATUS_LED, OUTPUT);
-  digitalWrite(PIN_STATUS_LED, HIGH);
+  digitalWrite(PIN_STATUS_LED, LOW);
 
   // INPUT_PULLUP switches on a resistor inside the ESP32 that holds the pin at
   // 3V3 while the button is open. The other leg of the button goes to GND, so
@@ -2265,37 +2436,16 @@ void loop() {
       Serial.println(buttonPressed ? "BUTTON PRESSED" : "BUTTON RELEASED");
     }
 
+    // One gesture, one meaning: advance the cycle. Acted on the press rather
+    // than the release, because there is no longer a length to measure and a
+    // control that answers on the way down feels immediate.
+    //
+    // Every case the old three rules handled falls out of this on its own. A
+    // press during the entry calibration takes AUTO to STANDBY, and leaving
+    // AUTO is what aborts a running calibration. A press while the rover is
+    // steering does the same and stops it. Nothing needed a special branch.
     if (buttonPressed) {
-      buttonPressedAtMs = now;
-    } else {
-      // Acted on at the release rather than the moment the threshold is
-      // crossed. The block already runs only on debounced transitions, so a
-      // length is one subtraction here; firing mid-press would mean a new test
-      // on every pass for as long as a finger is down, and separate logic to
-      // keep the release that follows from acting a second time.
-      const unsigned long held = now - buttonPressedAtMs;
-
-      // Three rules, and the first one is the safety rule: while anything is
-      // running, any press stops it. Not only a short press - a rover already
-      // moving across the floor is the worst moment to have to remember how
-      // long to hold a button for.
-      if (calibrationRunning()) {
-        abortCalibration();
-      } else if (lkaActive) {
-        lkaActive = false;
-        commandedLeft = 0;
-        commandedRight = 0;
-
-        Serial.println("LKA  stopped by button");
-      } else if (held >= CAL_BUTTON_LONG_MS) {
-        startCalibration();
-      } else if (calPhase == CalPhase::Ready) {
-        // Short press with a zero point already measured: carry on driving. The
-        // measurement survived the stop, so there is nothing to redo.
-        lkaActive = true;
-
-        Serial.println("LKA  resumed");
-      }
+      enterMode(nextMode(mode));
     }
   }
 
@@ -2433,64 +2583,65 @@ void loop() {
     confirmWarnStage();
   }
 
-  // The watchdog, and the single place the motors are written.
-  //
-  // Silence is read as a stop. The flag guards the condition rather than
-  // letting it fire on every pass once the deadline is past: after the values
-  // are zeroed there is nothing left to zero, and the message belongs to the
-  // moment the link went quiet rather than to every pass afterwards. Behind no
-  // log switch either, because those silence repeating reports and this is an
-  // event - if it happened, it is exactly what you need to see.
-  //
-  // safeDrive runs every pass rather than on a timer. Writing the same duty
-  // again is a few register writes that change nothing, while a timer would put
-  // a delay between the moment something decides to stop and the moment the
-  // motors are told. Placed after the distance read for the same reason: from
-  // phase 5 the layer inside safeDrive wants the freshest measurement this pass
-  // produced, not the previous one.
-  // Ahead of the watchdog and of safeDrive, so a spin command written this pass
-  // is refreshed, judged and applied in the same pass it was decided in.
-  //
-  // It also means the calibration wins over the phone. handleClient runs at the
-  // end of the loop, so anything a driving request stored is overwritten here on
-  // the following pass - which is the right way round: a browser and a
-  // calibration both steering would be two things turning one rover.
+  // Steps the measurement. It never writes a command and never moves a wheel -
+  // it only advances a phase, and lkaSteering() reads that phase to decide
+  // whether the rover may drive at all.
   updateCalibration();
 
-  // After the calibration, so a measurement that just finished is steering on
-  // the same pass it completed rather than the next one. Before the watchdog
-  // and safeDrive, so what it writes is judged like any other command.
+  // After the calibration, so a measurement that just finished steers on the
+  // same pass it completed rather than the next one. Before safeDrive, so what
+  // it writes is judged by the safety layer like any other command.
   updateLka();
 
-  // ⚠️ millis() here, NOT the loop's cached now, and the difference is not
-  // cosmetic - this line read `now` for a day and the rover was unusable.
+  // The watchdog. Silence is read as a stop, and the flag guards the condition
+  // rather than letting it fire on every pass once the deadline is past: after
+  // the values are zeroed there is nothing left to zero. Behind no log switch,
+  // because this is an event rather than a repeating report.
   //
-  // now is taken once at the top of the pass. Every other schedule in this loop
-  // compares it against a stamp written as `= now`, so the stamp can never be
-  // newer than now and a stale now only makes a check fire slightly late.
-  // lastCommandMs is the one exception in the whole loop: updateLka writes it
-  // from live millis(), several lines and one blocking distance read further
-  // down the pass - up to 92 ms after now was taken.
+  // ⚠️ millis() here, NOT the loop's cached now, and this is not cosmetic - the
+  // line read `now` for a day and the rover was unusable. now is taken once at
+  // the top of the pass, and every other schedule compares it against a stamp
+  // written as `= now`, which can therefore never be newer. lastCommandMs is
+  // the exception: it is written from live millis() inside a request handler,
+  // which runs later in the pass than now was taken. These are unsigned, so
+  // now - lastCommandMs with lastCommandMs the larger wraps to about 4.29
+  // billion instead of going negative, clearing any timeout ever written - and
+  // the watchdog then fires on a command issued microseconds earlier. A safety
+  // timer reads the clock when it asks, not what the clock said earlier.
   //
-  // These are unsigned. now - lastCommandMs with lastCommandMs the larger of
-  // the two does not go negative, it wraps to about 4.29 billion, which clears
-  // any timeout ever written. So the watchdog fired on a command issued
-  // microseconds earlier and cut the motors.
+  // ⚠️ MANUAL only, and that is a statement rather than a side effect. The
+  // watchdog measures whether the operator's channel is alive, and there is an
+  // operator in exactly one mode. In AUTO the rover is driving itself, so
+  // silence on a radio link is not an abnormality - it is the definition of the
+  // word. The consequence is deliberate and worth knowing: a rover left in AUTO
+  // that drives out of Wi-Fi range keeps going. The AEB still brakes it for
+  // obstacles, but nothing brings it home.
   //
-  // It did not fire continuously, which is what hid it: commandTimedOut latches
-  // and silences it - until the dashboard's 120 ms heartbeat cleared the latch
-  // and armed it again. With the page shut the rover drove perfectly; with the
-  // page open the motors were cut about eight times a second. Opening the
-  // dashboard to watch the fault was what caused it.
-  //
-  // A safety timer asks how long ago something happened. It has to read the
-  // clock when it asks, not remember what the clock said earlier in the pass.
-  if (!commandTimedOut && millis() - lastCommandMs >= COMMAND_TIMEOUT_MS) {
+  // Until phase 7 this was true by accident. updateLka ended by refreshing
+  // lastCommandMs, so the timer never expired while the controller ran - the
+  // same class of "an ordering, not a guarantee" that the guard in handleDrive
+  // was written to remove.
+  if (mode == Mode::Manual && !commandTimedOut &&
+      millis() - lastCommandMs >= COMMAND_TIMEOUT_MS) {
     commandedLeft = 0;
     commandedRight = 0;
     commandTimedOut = true;
 
     Serial.println("WATCHDOG  no command within timeout, motors stopped");
+  }
+
+  // ⚠️ A command may stand only while a source entitled to give it exists, and
+  // this is checked every pass rather than at the transition that ended it.
+  // LEDC holds the last duty written until something writes another: a mode
+  // that merely stops deciding leaves the rover driving on the last order it
+  // was given. STANDBY has to write the zero, not just refrain from writing.
+  //
+  // Every pass, for the reason safeDrive itself runs every pass: a state is not
+  // a moment, and clearing only on entry would let any future writer move a
+  // parked rover between transitions.
+  if (!commandSourceActive()) {
+    commandedLeft = 0;
+    commandedRight = 0;
   }
 
   safeDrive(commandedLeft, commandedRight);
