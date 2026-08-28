@@ -701,11 +701,17 @@ constexpr int32_t LINE_DIFF_FULL_SCALE = 600;
 
 // Below this much error, nothing is corrected.
 //
-// The lane is 16 cm and the sensors sit 12.5 cm apart, so there is 1.75 cm of
+// The lane is 25 cm and the sensors sit 12.5 cm apart, so there is 6.25 cm of
 // travel on each side where neither sensor has reached a stripe. In the older
 // design that gap was free: both sensors read white and there was no signal at
 // all. A difference always has a value, so the gap has to be stated instead of
 // inherited - without it the rover would steer against its own noise.
+//
+// ⚠️ 25 cm is a specification, not a description of one track. The first
+// attempt was 16 cm, which left 1.75 cm a side - less than one correction moves
+// the rover sideways - so every correction landed it on the opposite stripe and
+// no value of Kp could hold it. Rebuild the track narrower and this looks like
+// a firmware fault with not one line changed.
 //
 // This is also what keeps the system lane keeping rather than lane centering.
 // It intervenes on approach to a marking; it does not hold the middle.
