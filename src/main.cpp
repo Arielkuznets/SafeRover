@@ -1017,6 +1017,13 @@ uint8_t aebWarnReads = 0;
 // threshold, which is the assumption made before any reading exists: open road.
 float aebLastValidCm = AEB_WARN_CM + 1.0f;
 
+// The worst stage actually enforced since the dashboard last asked, reset on
+// read - the same instrument pattern as lkaErrorMin/Max, and for the same
+// reason. The page polls every 500 ms and a braking event lasts about 50, so a
+// dashboard reading only the live stage would miss most of them and light its
+// warning after the rover had already stopped.
+AebStage aebPeakStage = AebStage::Clear;
+
 // A reason to sound the buzzer that is not the AEB: a refused calibration, or
 // the lane keeping stopping itself. Held as a start time rather than a deadline
 // so the comparison stays now - start and cannot wrap.
@@ -1126,6 +1133,14 @@ static void applyAebOutputs(bool movingForward, AebStage stage) {
   const bool sounding = movingForward && stage != AebStage::Clear && confirmed;
   const bool braking =
       movingForward && (stage == AebStage::Slow || stage == AebStage::Stop);
+
+  // Recorded here rather than in updateAebStage because this receives the stage
+  // that was actually enforced, including one forced by a stale reading. Gated
+  // on movingForward for the same reason the outputs are: a rover parked in
+  // front of a wall is not braking and has no event to report.
+  if (movingForward && stage > aebPeakStage) {
+    aebPeakStage = stage;
+  }
 
   // The buzzer has two owners now. Either can sound it; only both being quiet
   // silences it.
@@ -2006,13 +2021,23 @@ static void handleData() {
   json += ",\"errMax\":";
   json += (lkaErrorSeen ? String(lkaErrorMax) : String("null"));
 
+  // Two AEB fields, and they answer different questions. aeb is what the layer
+  // is doing right now; aebPeak is the worst it did since the last poll, which
+  // is the only way a 500 ms page can show a 50 ms braking event at all.
+  json += ",\"aeb\":\"";
+  json += aebStageName(aebStage);
+  json += "\",\"aebPeak\":\"";
+  json += aebStageName(aebPeakStage);
+  json += "\"";
+
   // ⚠️ The one place a handler clears state rather than only reporting it, and
   // a deliberate exception to the rule stated above. Reset on read is what
-  // makes the window mean "since you last looked" instead of "since boot" - an
-  // instrument that never forgets would show one early spike for the rest of
-  // the run. It is safe here because nothing in the control path reads these:
+  // makes these windows mean "since you last looked" instead of "since boot" -
+  // an instrument that never forgets would show one early spike for the rest of
+  // the run. It is safe here because nothing in the control path reads them:
   // they are diagnostic only, and no motor decision depends on them.
   lkaErrorSeen = false;
+  aebPeakStage = AebStage::Clear;
 
   json += "}";
 
