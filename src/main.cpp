@@ -821,16 +821,16 @@ unsigned long lastDisplayCheck = 0;
 bool displayReady = false;
 bool apUp = false;
 
-// What the last redraw was drawn from. Starts at a value no real count can
-// take, so the first check always draws rather than depending on the screen
-// happening to differ from zero.
+// What the last redraw was drawn from. Both seeded with values the real thing
+// can never take, so the first check always draws.
+//
+// Compared rather than flagged. A flag has to be raised by whoever changes the
+// thing, so every future writer has to remember; a comparison cannot be
+// forgotten. It also keeps the mode machine from having to know a screen
+// exists, which is what a flag raised inside enterMode made it do.
 constexpr uint8_t DISPLAY_STATIONS_UNKNOWN = 0xFF;
 uint8_t lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
-
-// Raised by anything that changes what the screen should say but is not the
-// station count - which since phase 7 means the mode. Starts true so the first
-// pass draws.
-bool screenDirty = true;
+Mode lastDrawnMode = static_cast<Mode>(0xFF);
 
 // The last readings the loop took, held at file scope so a request handler can
 // report them without measuring anything itself.
@@ -1540,6 +1540,12 @@ static void accumulateCalibrationSample() {
 static void failCalibration(const char *reason) {
   calPhase = CalPhase::Failed;
   calFailReason = reason;
+
+  // A refusal must not be mistakable for a button press that did not register -
+  // the operator would press again and fail again. Sounded here so it happens
+  // however the calibration was started, including from the dashboard where
+  // there is no mode to drop out of.
+  startAlert();
 }
 
 // Turns the window into a zero point, or refuses it.
@@ -1644,9 +1650,6 @@ static void enterMode(Mode next) {
   // Lit for anything that can move, which is the one question a single lamp
   // answers well.
   digitalWrite(PIN_STATUS_LED, next == Mode::Standby ? LOW : HIGH);
-
-  screenDirty = true;
-
 }
 
 // Steps the calibration, one loop pass at a time.
@@ -1683,26 +1686,23 @@ static void updateCalibration() {
   if (now - calPhaseStartMs >= CAL_SAMPLE_MS) {
     evaluateCalibration();
 
-    // A refused calibration must not be mistakable for a button press that did
-    // not register - the operator would press again and fail again, learning
-    // nothing. The buzzer says it happened, the phase says why, and the drop to
-    // STANDBY is what makes the rover safe while both are read.
-    //
-    // Done here rather than inside failCalibration so that function stays a
-    // report, and so it does not have to call something declared after it.
-    //
-    // The beep is unconditional; only the drop to STANDBY is not. A refusal is
-    // worth announcing whether it came from the AUTO transition or from the
-    // dashboard's measure-only button, and in the second case there is no mode
-    // to leave.
-    if (calPhase == CalPhase::Failed) {
-      startAlert();
-
-      if (mode == Mode::Auto) {
-        enterMode(Mode::Standby);
-      }
-    }
   }
+}
+
+// The one question a difference cannot answer.
+//
+// Both sensors on white and both on black look identical to a subtraction -
+// near zero either way - and the second means the rover has left the track
+// altogether. Levels are the only thing that separates them, so this is the
+// single place absolute readings are used, with a margin wide enough to survive
+// the lighting moving underneath it.
+//
+// A question, not an action. This used to stop the rover itself, which made the
+// controller depend on the state machine that starts it - and enterMode calls
+// startCalibration, so each needed the other. The loop asks and decides.
+static bool lkaOffLane() {
+  return lineLeftValue > calLeftWhite + LKA_OFF_LANE_MARGIN &&
+         lineRightValue > calRightWhite + LKA_OFF_LANE_MARGIN;
 }
 
 // The lane keeping controller. Runs once a pass while it is active.
@@ -1712,34 +1712,10 @@ static void updateCalibration() {
 // and the single write to the motors stays where it is, once a pass, after the
 // safety layer has had its say. The AEB can still slow or stop anything decided
 // here, and that ordering is the whole point of the seam built in phase 4.
+//
+// Gated by the caller rather than here, so the mode is one thing the controller
+// does not have to know about.
 static void updateLka() {
-  if (!lkaSteering()) {
-    return;
-  }
-
-  // The one question a difference cannot answer.
-  //
-  // Both sensors on white and both on black look identical to a subtraction -
-  // near zero either way - and the second means the rover has left the track
-  // altogether. Levels are the only thing that separates them, so this is the
-  // single place absolute readings are used, with a margin wide enough to
-  // survive the lighting moving underneath it.
-  if (lineLeftValue > calLeftWhite + LKA_OFF_LANE_MARGIN &&
-      lineRightValue > calRightWhite + LKA_OFF_LANE_MARGIN) {
-
-    // A full transition, not a flag being lowered. That is what discards the
-    // zero point, which the old version left behind: the rover has demonstrably
-    // left the lane, so the measurement it was steering by is describing a
-    // place it is no longer in.
-    //
-    // It sounds, because a rover that stopped itself somewhere unexpected is
-    // exactly the event an operator watching the floor rather than the phone
-    // needs to be told about.
-    startAlert();
-    enterMode(Mode::Standby);
-    return;
-  }
-
   const int32_t diff =
       static_cast<int32_t>(lineLeftValue) - static_cast<int32_t>(lineRightValue);
 
@@ -1848,8 +1824,7 @@ static void showStatusScreen(uint8_t stations) {
 
 // Redraws only when what the screen says has actually changed. The address is
 // fixed once setup() is over and the failure line cannot change at all, so two
-// things move: the station count, polled here, and the mode, which raises
-// screenDirty at the transition rather than being compared for.
+// things move: the station count and the mode, both polled here.
 static void updateStatusScreen() {
   // A failed begin() means there is no buffer to draw into. Reported at boot
   // and then left alone: the rover drives perfectly well without a screen.
@@ -1858,12 +1833,14 @@ static void updateStatusScreen() {
   }
 
   const uint8_t stations = WiFi.softAPgetStationNum();
-  if (!screenDirty && stations == lastDrawnStations) {
+  const Mode current = mode;
+
+  if (stations == lastDrawnStations && current == lastDrawnMode) {
     return;
   }
 
-  screenDirty = false;
   lastDrawnStations = stations;
+  lastDrawnMode = current;
   showStatusScreen(stations);
 }
 
@@ -2493,10 +2470,33 @@ void loop() {
   // whether the rover may drive at all.
   updateCalibration();
 
+  // The two decisions the functions above used to make for themselves.
+  // updateLka called enterMode, and enterMode calls startCalibration, so the
+  // controller and the state machine each needed the other; updateCalibration
+  // changed the mode for the same reason. The loop is the one place entitled to
+  // know about both.
+  //
+  // A refused calibration is not a state to drive in, and the drop to STANDBY
+  // is what makes the rover safe while the reason is read off the dashboard. It
+  // runs once: enterMode returns immediately when the mode is already right.
+  if (mode == Mode::Auto && calPhase == CalPhase::Failed) {
+    enterMode(Mode::Standby);
+  }
+
   // After the calibration, so a measurement that just finished steers on the
   // same pass it completed rather than the next one. Before safeDrive, so what
   // it writes is judged by the safety layer like any other command.
-  updateLka();
+  if (lkaSteering()) {
+    if (lkaOffLane()) {
+      // Demonstrably off the track, so the zero point it was steering by
+      // describes somewhere the rover no longer is - and leaving AUTO discards
+      // it. It sounds, because an operator watching the floor has to be told.
+      startAlert();
+      enterMode(Mode::Standby);
+    } else {
+      updateLka();
+    }
+  }
 
   // The watchdog. Silence is read as a stop, and the flag guards the condition
   // rather than letting it fire on every pass once the deadline is past: after
