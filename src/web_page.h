@@ -378,18 +378,37 @@ async function sendCommand(manual) {
 function hold(id, dir) {
   const el = $(id);
 
+  // Whether the press being ended is one that started here. pointerleave is a
+  // hover event: it fires whenever a pointer crosses the button, with nothing
+  // held down. A touch pointer only exists between finger down and finger up,
+  // so on a phone it could only ever fire inside a real press - but a mouse
+  // pointer exists all the time, and the stop below carries the manual mark,
+  // which the rover reads as the operator taking the wheel. Unguarded, moving
+  // the cursor across the pad dropped AUTO and threw away its calibration.
+  let held = false;
+
   el.addEventListener('pointerdown', () => {
+    held = true;
     currentDir = dir;
     sendCommand(true);
   });
 
   // Three ways a press can end, and only the first is the ordinary one.
   // pointercancel fires when the system takes the gesture over - a scroll, an
-  // edge swipe, an incoming call - and pointerleave when the finger slides off
+  // edge swipe, an incoming call - and pointerleave when the pointer slides off
   // the button without lifting. Sending one stop too many costs nothing;
   // missing one leaves the rover driving.
+  //
+  // Clearing the flag also makes the three mutually exclusive. They overlap in
+  // the ordinary case - a lift is followed by a leave - and the first of them
+  // has already sent the stop.
   ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => {
     el.addEventListener(ev, () => {
+      if (!held) {
+        return;
+      }
+
+      held = false;
       currentDir = 'stop';
       sendCommand(true);
     });
