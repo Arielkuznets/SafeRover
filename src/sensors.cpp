@@ -7,22 +7,12 @@ unsigned long lastLineRead = 0;
 unsigned long lastLineSummary = 0;
 unsigned long lastDistanceRead = 0;
 
-// The last readings the loop took, held at file scope so a request handler can
-// report them without measuring anything itself. Reading a sensor inside a
-// handler would let a browser decide when pulseIn fires, and two ultrasonic
-// bursts close together each measure the other's echo. Measuring stays the
-// loop's job; the page only reports what the loop already found.
-//
-// echoDurationValue keeps the meaning zero carries everywhere in this project:
-// no echo came back, which is not a distance.
+// Declared in sensors.h, defined here. Two ultrasonic bursts close together
+// each measure the other's echo, so measuring stays the loop's job.
 uint16_t lineLeftValue = 0;
 uint16_t lineRightValue = 0;
 unsigned long echoDurationValue = 0;
 
-// Per sensor rather than one shared pair. A shared span would let a sensor that
-// reached a stripe cover for one that never did - exactly the silent failure
-// the calibration has to be able to refuse.
-//
 // The minimums start at the top of the ADC range and the maximums at the
 // bottom, so the first reading replaces the seed rather than competing with it.
 uint16_t lineLeftMin = ADC_MAX_VALUE;
@@ -33,8 +23,7 @@ uint16_t lineRightMax = 0;
 // The worst interval observed between two consecutive line reads, and the
 // average over the last window. The loop asks for a rate; what it gets is that
 // rate plus whatever blocked in between, and readEchoMedian waiting out three
-// ultrasonic timeouts is by far the largest of those. The maximum catches the
-// worst case, the average says whether that case was an outlier.
+// ultrasonic timeouts is by far the largest of those.
 unsigned long lineGapMaxMs = 0;
 uint16_t lineReadsInWindow = 0;
 unsigned long lineAvgGapMs = 0;
@@ -52,11 +41,8 @@ uint16_t readLineAveraged(uint8_t pin) {
 }
 
 // One measurement: the width of the ECHO pulse in microseconds, or 0 when
-// nothing came back before the timeout.
-//
-// delayMicroseconds is not a scheduling delay here - the 10 us pulse *is* the
-// signal the module waits for, and holding the line is the only way to produce
-// it.
+// nothing came back before the timeout. delayMicroseconds is not a scheduling
+// delay here - the 10 us pulse *is* the signal the module waits for.
 static unsigned long readEchoDuration() {
   digitalWrite(PIN_ULTRASONIC_TRIG, LOW);
   delayMicroseconds(TRIG_SETTLE_US);
@@ -68,11 +54,9 @@ static unsigned long readEchoDuration() {
   return pulseIn(PIN_ULTRASONIC_ECHO, HIGH, ECHO_TIMEOUT_US);
 }
 
-// The median of the samples that came back, or 0 when too few did.
-//
-// The delay between samples is part of the measuring protocol, in the same
-// sense as the microsecond delays inside the trigger pulse: a burst fired
-// before the previous one has died away measures the old echo, not the new one.
+// The median of the samples that came back, or 0 when too few did. The delay
+// between samples is part of the measuring protocol: a burst fired before the
+// previous one has died away measures the old echo, not the new one.
 unsigned long readEchoMedian() {
   unsigned long valid[DISTANCE_SAMPLES];
   uint8_t validCount = 0;
@@ -93,8 +77,7 @@ unsigned long readEchoMedian() {
 
   // With most of the samples gone, reporting a distance from the one that
   // survived would be a guess presented as a measurement. A safety system is
-  // better off declaring it has no information: the caller already knows how to
-  // handle "no reading", and 0 is exactly that signal.
+  // better off declaring it has no information, and 0 is that signal.
   if (validCount < DISTANCE_MIN_VALID_SAMPLES) {
     return 0;
   }
@@ -114,9 +97,9 @@ unsigned long readEchoMedian() {
   }
 
   // An even count has no real middle, and the tie-break is the lower of the
-  // two. Averaging them would let a bad sample pull the result, which is the
-  // whole thing the median was chosen to avoid - and of two candidate distances
-  // the nearer one is the safe one for a brake to act on.
+  // two. Averaging would let a bad sample pull the result, which is the whole
+  // thing the median avoids - and of two candidates the nearer one is the safe
+  // one for a brake to act on.
   const uint8_t medianIndex =
       (validCount % 2 == 1) ? (validCount / 2) : (validCount / 2 - 1);
 
@@ -132,10 +115,9 @@ float distanceFromDuration(unsigned long durationUs) {
 // first measurement, and sets the ADC up for the line sensors.
 //
 // analogSetAttenuation, not the per-pin form. The per-pin call reconfigures a
-// channel that already exists, and the core only opens a channel on the first
+// channel that already exists, and the core only opens one on the first
 // analogRead of that pin - so calling it here found nothing to reconfigure and
-// was dropped with an error on every boot. This form sets the value the
-// channels are built with.
+// was dropped with an error on every boot.
 void sensorsBegin() {
   pinMode(PIN_ULTRASONIC_TRIG, OUTPUT);
   digitalWrite(PIN_ULTRASONIC_TRIG, LOW);

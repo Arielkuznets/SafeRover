@@ -13,7 +13,7 @@ static uint8_t aebWarnReads = 0;
 
 // The last distance that actually came back, because a missing echo means
 // different things depending on what preceded it. Started just outside the warn
-// threshold: the assumption made before any reading exists is open road.
+// threshold: before any reading exists the assumption is open road.
 static float aebLastValidCm = AEB_WARN_CM + 1.0f;
 
 // The worst stage enforced since the dashboard last asked, reset on read there.
@@ -22,7 +22,7 @@ static float aebLastValidCm = AEB_WARN_CM + 1.0f;
 AebStage aebPeakStage = AebStage::Clear;
 
 // A reason to sound the buzzer that is not the AEB. Held as a start time rather
-// than a deadline so the comparison stays now - start and cannot wrap.
+// than a deadline, so the comparison cannot wrap.
 static unsigned long alertStartMs = 0;
 static bool alertRaised = false;
 
@@ -43,9 +43,8 @@ static bool alertSounding() {
 // reading is announced too.
 //
 // Both are gated on the operator asking for movement: a rover parked near a
-// wall has nothing to announce, and a warning that never stops carries no
-// information. The brake light follows only the stages that actually slow the
-// rover, the same as a car - lamps mean deceleration, not concern.
+// wall has nothing to announce. The brake light follows only the stages that
+// actually slow the rover, the same as a car - lamps mean deceleration.
 static void applyAebOutputs(bool movingForward, AebStage stage) {
   // Warn has to have held for a while; the two stages that act on the motors
   // announce themselves the moment they are entered.
@@ -68,16 +67,12 @@ static void applyAebOutputs(bool movingForward, AebStage stage) {
   ledcWrite(PIN_BRAKE_LIGHT, braking ? PWM_MAX_DUTY : 0);
 }
 
-// The one door to the motors, and the only thing any driving decision may call.
 // Manual control and the lane keeping both come through here, so the AEB
-// intercepts every one of them without touching the code that decides where to
-// go. A safety layer navigation can route around is not a safety layer.
-//
-// The one exception is the drive() in motorsBegin - hardware initialisation
-// rather than a driving decision, at a moment when there is no reading to
-// reason about.
+// intercepts both without touching the code that decides where to go. The one
+// exception is the drive() in motorsBegin - hardware initialisation, at a
+// moment when there is no reading to reason about.
 void safeDrive(int16_t left, int16_t right) {
-  // Its own clock rather than one handed in: a caller cannot pass a stale
+  // Its own clock rather than one handed in, so a caller cannot pass a stale
   // timestamp and talk this layer out of the check.
   const bool readingStale =
       (millis() - lastDistanceRead) > AEB_READING_MAX_AGE_MS;
@@ -88,7 +83,7 @@ void safeDrive(int16_t left, int16_t right) {
   const AebStage stage = readingStale ? AebStage::Stop : aebStage;
 
   // Heading at it, not merely moving - the sensor faces forward, so reversing
-  // away from an obstacle is the safest thing an operator can do there.
+  // away from an obstacle is the safest thing an operator can do.
   //
   // Deliberately NOT the same test as the escape rule below. That asks whether
   // any side is negative, this whether any is positive, and a pivot answers yes
@@ -97,8 +92,8 @@ void safeDrive(int16_t left, int16_t right) {
   applyAebOutputs(left > 0 || right > 0, stage);
 
   // Nothing asked for, so there is nothing to hold back. Braking a stationary
-  // rover arrests nothing and would hold both enable pins at full duty
-  // indefinitely, leaving the L298N conducting for no reason.
+  // rover arrests nothing and would hold both enable pins at full duty, leaving
+  // the L298N conducting for no reason.
   if (left == 0 && right == 0) {
     drive(0, 0, StopMode::Coast);
     return;
@@ -145,7 +140,7 @@ const char *aebStageName(AebStage stage) {
 }
 
 // Picks the stage from the reading the loop has just taken, once per
-// measurement rather than once per pass. It decides and does nothing else -
+// measurement rather than once per pass. It decides and does nothing else:
 // enforcement belongs inside safeDrive, where no caller can route around it.
 void updateAebStage() {
   if (echoDurationValue == 0) {
@@ -164,17 +159,16 @@ void updateAebStage() {
     // Sustained silence means opposite things depending on what came before.
     // Losing the echo at three metres is open road - the module only reaches
     // about four. Losing it at fifteen centimetres is something close, possibly
-    // inside the blind zone under 2 cm, which returns nothing at all.
-    //
-    // The hole this leaves is a sensor that dies while the road really is
-    // empty. Closing it would mean stopping in every open room.
+    // inside the blind zone under 2 cm. The hole this leaves is a sensor that
+    // dies while the road really is empty; closing it would mean stopping in
+    // every open room.
     aebStage =
         (aebLastValidCm <= AEB_WARN_CM) ? AebStage::Stop : AebStage::Clear;
   } else {
     aebMissedReads = 0;
 
     // Scoped to this branch: the other has no distance to speak of, and a
-    // variable declared above both would need a placeholder that means nothing.
+    // variable above both would need a placeholder that means nothing.
     const float distanceCm = distanceFromDuration(echoDurationValue);
     aebLastValidCm = distanceCm;
 
@@ -218,7 +212,7 @@ void updateAebStage() {
 }
 
 // Counts how long Warn has held. Kept out of updateAebStage so the stage
-// machine stays the one thing that decides the stage, and called from beside it
+// machine stays the one thing that decides the stage, and called beside it
 // because it counts readings rather than loop passes.
 void confirmWarnStage() {
   if (aebStage != AebStage::Warn) {

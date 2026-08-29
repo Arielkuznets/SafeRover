@@ -34,11 +34,9 @@ constexpr uint8_t PIN_MOTOR_IN4 = 27;
 constexpr uint8_t PIN_MOTOR_ENB = 14; // right side speed
 
 // ADC1 only. ADC2 shares hardware with the radio and cannot be read while Wi-Fi
-// is running, which confines every analog sensor to GPIO 32-39.
-//
-// Only the analog outputs are wired: lane keeping has to know how far a sensor
-// has gone into a stripe, not merely that it has, and the digital output cannot
-// say that.
+// is running, which confines every analog sensor to GPIO 32-39. Only the analog
+// outputs are wired: lane keeping has to know how far a sensor has gone into a
+// stripe, not merely that it has.
 //
 // A HIGH value means a DARK surface - the opposite of the intuitive reading,
 // and inverting it is the easiest mistake to make here. Inside the lane both
@@ -57,8 +55,7 @@ constexpr uint8_t PIN_LINE_SENSOR_RIGHT = 35;
 //
 // Mounted on the upper deck, and that is calibration rather than tidiness. From
 // the lower deck the beam spread reached the floor at a shallow angle and came
-// back, reading as an obstacle on clear ground. Remounting it low brings that
-// back.
+// back, reading as an obstacle on clear ground.
 constexpr uint8_t PIN_ULTRASONIC_TRIG = 5;
 constexpr uint8_t PIN_ULTRASONIC_ECHO = 18;
 

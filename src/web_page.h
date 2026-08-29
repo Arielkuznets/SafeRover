@@ -8,7 +8,7 @@
 // handleClient() call - so splitting them would slow the page down and give the
 // loop more work.
 //
-// ⚠️ No web fonts, no CDN, no external anything. The phone is associated to the
+// No web fonts, no CDN, no external anything. The phone is associated to the
 // rover's own access point and has no route to the internet, so an external
 // stylesheet does not fail slowly - it never arrives at all. System fonts only.
 //
@@ -355,7 +355,7 @@ speedEl.addEventListener('input', () => { $('sv').textContent = speedEl.value; }
 // Reports the current intent. Not "do this once" but "this is what I want now",
 // which is why repeats and out-of-order arrivals are harmless.
 //
-// ⚠️ The manual flag separates the two kinds of message this sends. A press is
+// The manual flag separates the two kinds of message this sends. A press is
 // the operator asking for something and carries it; the heartbeat below does
 // not. The rover switches to MANUAL on the mark alone and never on the content,
 // which is what lets STOP stop an autonomous rover while eight unmarked
