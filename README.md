@@ -114,6 +114,37 @@ ran out. **Silence on a control channel is not consent to keep going.**
 Letting go of a button is the ordinary way to stop and takes effect immediately. The
 watchdog exists for the case where "stop" cannot be sent at all.
 
+### ☁️ The brake log — and a rover that keeps a stopwatch, not a clock
+
+Every time the braking layer enters its **Stop** stage, the rover writes down the
+distance that caused it. At the end of a run one button on the dashboard sends the
+whole log to **Adafruit IO**, each entry carrying a real date and time.
+
+The interesting part is where the time comes from. **The rover has no clock while it
+drives, and does not need one** — it only needs to know how long ago each event
+happened:
+
+```
+while driving   event.atMs = millis()            an uptime, not a date
+at upload       ntpEpoch   = time(nullptr)       the wall clock, fetched once
+                eventEpoch = ntpEpoch - (now - event.atMs)
+```
+
+One answer from an NTP server resolves every queued event at once. Nothing about the
+network is needed while the rover is moving, which is the whole point:
+
+> **The radio never competes with the brakes — not because a condition says so, but
+> because they never run at the same time.**
+
+Uploading takes the access point down first. One radio cannot serve a network and join
+another on a different channel, so the two are kept apart in time rather than fought
+over. While the access point is down the dashboard is unreachable by design — which is
+what the small screen on the vehicle is for, and the only moment in the project where
+it is the only channel available.
+
+An event leaves the queue **only** once the server confirms it. A failed upload keeps
+everything it had and can simply be retried.
+
 ---
 
 ## Hardware
@@ -253,7 +284,20 @@ build, or the compile fails on a missing include:
 ```cpp
 #pragma once
 constexpr char WIFI_AP_PASSWORD[] = "your-passphrase";  // WPA2: 8 characters minimum
+
+// The network the rover joins to upload its brake log. A phone hotspot works.
+// The SSID must be plain ASCII.
+constexpr char WIFI_STA_SSID[] = "your-network";
+constexpr char WIFI_STA_PASSWORD[] = "your-network-passphrase";
+
+// From the "My Key" dialog on io.adafruit.com. The key is a password.
+constexpr char AIO_USERNAME[] = "your-adafruit-username";
+constexpr char AIO_KEY[] = "your-aio-key";
 ```
+
+Uploading also needs a feed named `brake-events` on that account. Without the four
+station and Adafruit values the firmware still builds and drives — only the upload
+fails, and it reports why on the vehicle's screen.
 
 The network name is `Saferover`, and it is in the source: an SSID is broadcast over
 the air anyway, so hiding it would protect nothing and only make the network harder
@@ -280,8 +324,8 @@ pio run -e i2c-scanner -t upload
 | 4 | Phone control — Wi-Fi dashboard + watchdog stop | ✅ |
 | 5 | AEB — 3-stage braking + hysteresis | ✅ |
 | 6 | LKA — track + P-controller tuning | ✅ |
-| 7 | Brain — state machine + non-blocking loop | ⬜ |
-| 8 | IoT — live dashboard, NTP, cloud event log | ⬜ |
+| 7 | Brain — state machine + module split | ✅ |
+| 8 | IoT — NTP clock + cloud brake log | ✅ |
 | 9 | Finish — enclosure, portfolio, dry run | ⬜ |
 
 ### Progress photos
