@@ -14,12 +14,14 @@ with little rewriting:
 - **Decisions & rationale** — what was chosen and *why*, including what was rejected.
 - **Next up** — the exact next action.
 
-Entries run oldest first. Sessions 1 and 2 were written retroactively on 2026-07-28;
-from session 3 onward each entry is written the same day.
+Entries run oldest first. Most entries were written the same day as the work they
+describe. Three were not: sessions 1 and 2 were written retroactively on 2026-07-28,
+and sessions 25 and 26 on 2026-09-04, when the phase they belong to was finished.
 
 The wording and structure of these entries were worked out with the help of an AI
-assistant. The observations, the measurements, the faults and the decisions they
-record are the author's own.
+assistant, which also reviewed the code and found several of the faults recorded from
+session 26 onward. The observations, the measurements and the decisions are the
+author's own.
 
 ---
 
@@ -2577,3 +2579,320 @@ Next is phase 7 — the state machine — which replaces `lkaActive` and the thr
 button rules with STANDBY, MANUAL and AUTONOMOUS. It is also the reason
 `handleDrive` was hardened this session: that guard exists so the rewrite cannot
 reintroduce Fault 4 from a different direction.
+
+## Session 25 — 2026-08-28 — The state machine, and one condition that closed three holes
+
+### Goal
+Replace the flags that had accumulated around driving — `lkaActive`, the three
+button rules, the ordering that `handleDrive` depended on — with a single explicit
+state machine, so that "exactly one source drives at a time" becomes a structural
+property rather than something several places have to agree about.
+
+### What was done
+- Added `enum class Mode { Standby, Manual, Auto }` with `enterMode()` as its only
+  writer. Exit work and entry work both happen inside it, so a transition cannot
+  half-occur somewhere else.
+- Deleted `lkaActive`. Whether the lane keeping is steering is now *derived*:
+  `mode == Auto && calPhase == Ready`.
+- Removed the button's long press. It only cycles modes now, and the calibration it
+  used to start belongs to the AUTO transition instead.
+- Rebuilt the dashboard around the mode: arrows and a stop button, a speed slider
+  that dims outside MANUAL, a full-width banner for braking, and a calibrate button.
+- Added a measure-only calibration endpoint, usable in STANDBY, that takes a zero
+  point without driving on it.
+- Removed every `Serial` print and `Serial.begin()` from the firmware.
+
+**The heartbeat problem, and why the mark is by origin.** The page repeats the
+current intent about eight times a second whether or not anything is touched — that
+repetition is what the watchdog measures. If those messages counted as instructions,
+connecting a phone would drag the rover out of STANDBY immediately, and out of AUTO
+several times a second after that. The solution is that only a *marked* request
+counts: a real press carries `manual=1`, the heartbeat does not. The decision is
+made on where the message came from, never on what it asks for — which is also why
+the STOP button still stops an autonomous rover. It is a press, so it is marked, so
+it takes the wheel, even though what it asks for is a stop.
+
+### Problems & challenges
+
+**Fault 1 — a mode that stops deciding does not stop the rover**
+
+- **Symptom:** identified in design rather than on the floor. STANDBY was written as
+  "do nothing", which leaves the previously commanded values in place.
+- **Diagnosis:** nothing in this system decays on its own. The PWM peripheral holds
+  the last duty written until something writes another, so a mode that merely stops
+  issuing commands leaves the rover driving on its last order indefinitely.
+- **Solution:** STANDBY writes zero actively, every pass, rather than refraining
+  from writing.
+
+**Fault 2 — three separate holes with one shared shape**
+
+- **Symptom:** three different ways a stale command could survive: a heartbeat
+  driving a parked rover, a held button driving the rover through its own entry
+  calibration, and a command left standing after the lane keeping gave up.
+- **Diagnosis:** all three are the same rule stated three times — a command may
+  stand only while a source entitled to give it exists. Each had been guarded
+  separately, and each guard depended on something else remembering.
+- **Solution:** one derived condition, `commandSourceActive()`, checked every pass.
+  Clearing only at the transition that ended a mode would let any future writer move
+  a parked rover between transitions, so the check is not tied to the transition at
+  all.
+
+**Fault 3 — comments that no longer described the code**
+
+- **Symptom:** several comments described behaviour that had been replaced.
+- **Diagnosis:** they had been correct when written. `calPhase` still explained a
+  long press and a power cycle that no longer exist; `LKA_DEADBAND` described a 16 cm
+  lane, which is the width that *failed*; the watchdog block named `updateLka` as the
+  writer of the timestamp it no longer touches.
+- **Solution:** each was rewritten against the code as it now stands. A wrong comment
+  is worse than no comment: it is read, believed and repeated.
+
+### Decisions & rationale
+- **The AEB is a layer, not a mode.** It runs in all three modes, inside `safeDrive`,
+  and nothing in the state machine can switch it off. Making it a fourth mode would
+  have made it something the machine could leave.
+- **Derived conditions instead of flags.** A flag has to be cleared on every path out,
+  including paths added later; a derived condition cannot be left behind. This is what
+  allowed `lkaActive` to be deleted rather than maintained.
+- **Calibration is discarded on every exit from AUTO.** The measurement behind this is
+  in session 24: the resting difference came out −101 on one run and −314 on another
+  with nothing touched between them, a spread larger than the deadband. A zero point
+  that moves that much standing still cannot be trusted to survive being driven.
+- **No watchdog in AUTO, deliberately.** The watchdog measures whether the operator's
+  channel is alive, and there is an operator in exactly one mode. The consequence is
+  accepted and worth stating: a rover left in AUTO that drives out of range keeps
+  going. The braking layer still stops it for obstacles; nothing brings it home.
+- **Serial removed entirely.** Every fault it used to report now has somewhere better
+  to appear — the mode on the screen and the status LED, the calibration reason on the
+  dashboard, the buzzer for anything heard while looking at the floor. It was never
+  readable during a run in any case: the rover is untethered, and plugging a cable in
+  afterwards resets the board. The removal was expected to save very little and freed
+  **14,228 bytes** of flash — the estimate was wrong by an order of magnitude, which
+  is itself the argument for measuring rather than assuming.
+
+### Next up
+Split `main.cpp`. It has reached 2,583 lines and every layer of the rover lives in it.
+
+
+## Session 26 — 2026-08-29 — main.cpp split into modules
+
+### Goal
+Break the single 2,583-line source file into modules with one responsibility each,
+without changing any behaviour, so that the safety invariant becomes structural
+rather than a rule that has to be remembered.
+
+### What was done
+- Broke two dependency cycles **first**, while the code was still one file, so that
+  the split itself could be a pure move.
+- Split `main.cpp` into nine modules — `pins`, `config`, `sensors`, `motors`, `aeb`,
+  `lka`, `modes`, `display`, `web` — leaving 105 lines of scheduler behind.
+- Moved `dutyFromPercent` into `config.h`, which leaves `motors.h` included by exactly
+  three files.
+- Tightened encapsulation: fifteen previously global symbols became file-private.
+- Cut the comments back and corrected two that were wrong.
+
+**The rule that shapes the result.** No module header includes another module header;
+only `pins.h` and `config.h` are included by headers. That makes the include graph a
+tree rather than a web, and it is the reason the project is still explainable at 1,700
+lines.
+
+### Problems & challenges
+
+**Fault 1 — two cycles that would have survived the split**
+
+- **Symptom:** the module boundaries could not be drawn. `updateLka` called
+  `enterMode` when it found itself off the lane, and `enterMode` calls
+  `startCalibration` — so the controller and the state machine each needed the other.
+  `updateCalibration` changed the mode for the same reason, and `enterMode` raised a
+  `screenDirty` flag, which made the state machine know a screen exists.
+- **Diagnosis:** these are not splitting problems. They are design problems that a
+  single file had been hiding, and the split only made them visible.
+- **Solution:** the off-lane test became a question the loop asks and acts on, the
+  drop to STANDBY after a refused calibration moved to the loop, and the screen now
+  compares what it last drew against what is current instead of being told. Done as
+  its own commit, before the move, so the move itself changed nothing.
+
+**Fault 2 — a mouse could disengage the lane keeping**
+
+- **Symptom:** found by review rather than on the floor. The dashboard sent a stop
+  carrying the operator mark whenever a pointer left a direction button.
+- **Diagnosis:** `pointerleave` is a hover event. It fires whenever a pointer crosses
+  the element, with nothing held down. A touch pointer only exists between finger
+  down and finger up, so on a phone it could only ever fire inside a real press — but
+  a mouse pointer exists all the time. Passing the cursor over the pad would have sent
+  a marked command, and in AUTO a marked command discards the calibration and takes
+  the wheel.
+- **Solution:** the end handlers now act only on a press that started on that button.
+- **Method note:** this is the origin-based marking from session 25 being defeated by
+  an input device the design had not considered. The rule was right; its coverage was
+  not.
+
+**Fault 3 — two comments that contradicted the measurements**
+
+- **Symptom:** `LINE_DIFF_FULL_SCALE` was described in the code as a corrected value,
+  with 1800 as the misreading and 600 as the truth.
+- **Diagnosis:** the journal has it the other way round, and correctly. 1800 is a
+  measured quantity; 600 came from a run whose error range is now known to have been
+  held small by the watchdog fault, and session 24 records it as unvalidated. The code
+  presented as settled exactly what the journal marks as unproven.
+- **Solution:** the comment now says so. Separately, the AEB margin attributed 15 cm to
+  the 85 ms a reading takes, which gives 7 cm; the figure that matters is the *age* of
+  the reading — the interval between reads plus the time one takes — and it is about
+  11 cm.
+- **Method note:** the code and the journal are two records of the same decisions, and
+  nothing had ever compared them. Where they disagreed, the journal was right both
+  times.
+
+### Decisions & rationale
+- **The cycles were broken before the split, not during it.** Mixing the two would
+  have produced one diff in which a reader could not tell what moved from what
+  changed.
+- **`dutyFromPercent` moved to `config.h`.** It is arithmetic on a constant with no
+  hardware in it, so lane keeping and the web handlers can convert a percent without
+  being handed a declaration of `drive()`. That is what leaves `motors.h` in three
+  files and makes the braking layer impossible to route around by construction rather
+  than by convention.
+- **Comments were cut by rule, not by percentage.** What went: the history of rejected
+  alternatives, which git and this journal already hold, and the duplication the split
+  created. What stayed: everything the code cannot say for itself — the buzzer being
+  active low, a high line reading meaning a dark surface, ADC2 being unusable with the
+  radio, the live clock in the watchdog.
+- **The binary grew by 748 bytes across the split, and that is expected.** In one file
+  every function was file-private and could be inlined freely; across translation
+  units, without link-time optimisation, each has to be emitted. The cost is real and
+  was accepted for the structure it buys.
+
+### Next up
+Phase 8 — the cloud brake log.
+
+
+## Session 27 — 2026-09-04 — The brake log, and a rover that keeps a stopwatch
+
+The module was written on 2026-08-31 and verified on the vehicle on 2026-09-04; this
+entry covers both.
+
+### Goal
+Record every emergency stop with the distance that caused it, and upload the log to
+Adafruit IO with real timestamps — closing the IoT requirement in both directions,
+without letting the network reach the loop that runs the braking layer.
+
+### What was done
+- Added a `cloud` module: a sixteen-entry ring buffer of brake events, an upload phase
+  machine, the NTP call and the HTTP POST.
+- Recorded events by comparing the AEB stage against what was last seen, which left
+  `aeb.cpp` untouched.
+- Added a `POST /upload` endpoint, refused outside STANDBY, and a second OLED screen
+  that reports the upload while the dashboard cannot be reached.
+
+**The idea the phase rests on.** The rover does not need to know the time while it
+drives — only how long ago each event happened. Events are recorded with an uptime;
+one NTP answer at upload time resolves all of them to dates:
+
+```
+eventEpoch = ntpEpoch - (ntpAtMs - event.atMs)
+```
+
+This is what keeps `setup()` unchanged and the radio out of the driving loop entirely.
+The two never run at the same time, so no condition has to keep them apart.
+
+**Why the upload is not immediate.** Three reasons, and any one of them is sufficient.
+A network request blocks, and the loop it would block runs the braking layer — with
+the PWM peripheral holding the last duty written, a rover at 85% would stay at 85% for
+the whole request. One radio cannot serve an access point and join another network on
+a different channel. And the network used here is a phone, which cannot be a hotspot
+and a client of the rover at the same time.
+
+### Problems & challenges
+
+**Fault 1 — the association was attempted once, at the one moment it could not succeed**
+
+- **Symptom:** found by review. The waiting phase allows sixty seconds for the
+  operator to reach the phone and switch the hotspot on, but `WiFi.begin()` was called
+  once, at the start of that window — precisely when the network is deliberately still
+  off.
+- **Diagnosis:** the whole window therefore rested on the core's own reconnect
+  behaviour, which is not something the central mechanism of a phase should depend on.
+  Worse, a single reading of `WL_CONNECT_FAILED` ended the attempt immediately, which
+  would have collapsed sixty seconds into about two.
+- **Solution:** the attempt is re-issued every five seconds, and only from a settled
+  state so that an association already in progress is not aborted.
+  `WL_CONNECT_FAILED` is remembered rather than acted on, and separates "wrong
+  passphrase" from "network not up yet" only once the window has expired.
+
+**Fault 2 — a second upload could never start**
+
+- **Symptom:** found by review. After one upload the button would have been dead until
+  the board was reset.
+- **Diagnosis:** the phase machine handled `Idle`, but `Done` and `Failed` fell through
+  to a default branch that returned without ever looking for a new request.
+- **Solution:** all three non-running states now accept a request.
+
+**Fault 3 — two radio reconfigurations in opposing directions**
+
+- **Symptom:** the station was taken down *after* the access point had already been
+  raised again.
+- **Diagnosis:** the order was left to whichever function ran first, which makes the
+  end state depend on scheduling rather than on a decision.
+- **Solution:** one exit path, taken before the loop is involved at all.
+
+**Fault 4 — a guard with a three-hundred-millisecond gap in it**
+
+- **Symptom:** uploading is refused outside STANDBY, but the reply to the request is
+  sent a moment before the work begins, so the mode could still be changed inside that
+  grace period.
+- **Diagnosis:** the guard tested whether an upload was *running*. During the grace it
+  is not running, but the decision to start it has already been made.
+- **Solution:** a separate condition covering both, used where the mode button is read.
+
+**A counter that did nothing**
+
+Recorded separately because nothing failed. A count of failed uploads was written and
+never read anywhere, and since sending stops at the first failure it could only ever
+have been zero or one — which the phase already says, with the reason beside it. It
+was removed.
+
+### Verification on the vehicle
+The upload was exercised on the vehicle. A single brake event was recorded at
+**34.4 cm** — just inside the 35 cm STOP threshold — and uploaded with a timestamp
+matching the wall clock, which confirms the NTP anchor and the uptime arithmetic
+behind it. The OLED was watched through the whole sequence and showed each phase in
+turn. The refusal paths were exercised too: an upload attempted with no hotspot
+reported `no wifi` and kept the queue, a second upload after a completed one started
+normally, and the button was refused outside STANDBY.
+
+That the event exists at all is also the evidence the rover still drives correctly
+after the phase: producing it required a real run, a real measurement and a real
+braking decision.
+
+### Decisions & rationale
+- **Sixteen events, and the number is not arbitrary.** The free Adafruit IO tier allows
+  roughly thirty data points a minute, so a full queue sent in one go stays under it
+  with room to spare. The queue costs 128 bytes.
+- **Recorded on the transition into Stop, not on the state of being stopped.** Sitting
+  at Stop for three seconds is one event; without the comparison it would be dozens,
+  and a single obstacle would fill the queue.
+- **The observer runs inside the distance-read block.** `aebStage` can only change
+  there, so an observer at the same cadence cannot miss a transition. Running it in the
+  loop body would let a stop that came and went between two checks vanish from the log.
+- **Comparison rather than a call from `aeb.cpp`.** A call would invert the dependency —
+  the safety layer would need to know a network layer exists — and a call site can be
+  forgotten when another path to Stop is added later. A comparison cannot.
+- **The loop raises the access point, not the cloud module.** Raising it belongs to the
+  web module, and the web module already reads the cloud module; the reverse dependency
+  would close a cycle. This is the same arrangement as the drop to STANDBY after a
+  refused calibration.
+- **An event leaves the queue only on a confirmed acceptance.** A failed upload keeps
+  everything it had and can simply be retried.
+- **TLS with certificate validation disabled.** It encrypts the exchange but does not
+  verify the other end: protection against a passive listener, not against an active
+  impersonator. The alternative is carrying a certificate bundle that expires and then
+  breaks the rover with nothing having changed. The network here is a phone held by the
+  operator. Measured cost: 149,384 bytes of flash and 2,496 of RAM, against a budget
+  that ends at 38% and 15.7%.
+- **Events live in RAM and do not survive a reset.** This is a log for one power
+  session. Making it outlast a reboot means non-volatile storage, which was judged too
+  large an addition at the end of the project. Recorded as a known limit, not an
+  oversight.
+
+### Next up
+Phase 9 — the demonstration dry run.
