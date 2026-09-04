@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 
+#include "cloud.h"
 #include "config.h"
 #include "modes.h"
 #include "pins.h"
@@ -24,6 +25,60 @@ bool apUp = false;
 static constexpr uint8_t DISPLAY_STATIONS_UNKNOWN = 0xFF;
 static uint8_t lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
 static Mode lastDrawnMode = static_cast<Mode>(0xFF);
+
+// The upload has its own screen, and its own two things that move. The seconds
+// are counted in whole units so the countdown redraws once a second rather than
+// on every pass.
+static UploadPhase lastDrawnPhase = static_cast<UploadPhase>(0xFF);
+static uint8_t lastDrawnDetail = 0xFF;
+
+// What the rover has to say while the dashboard cannot be reached. During an
+// upload the access point is down by design, so this panel is the only channel
+// left - which is the whole reason a screen worth almost nothing during normal
+// driving earns its place on the vehicle.
+static void showUploadScreen() {
+  display.clearDisplay();
+
+  constexpr uint16_t FOREGROUND = SSD1306_WHITE;
+
+  display.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, FOREGROUND);
+  display.setTextSize(1);
+  display.setTextColor(FOREGROUND);
+
+  display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP);
+  display.print(SCREEN_UPLOAD_TITLE);
+
+  display.setCursor(OLED_TEXT_LEFT, OLED_TEXT_TOP + OLED_LINE_SPACING);
+
+  switch (uploadPhase) {
+  case UploadPhase::Waiting:
+    display.print(SCREEN_UPLOAD_WAIT);
+    display.print(uploadSecondsLeft());
+    display.print('s');
+    break;
+  case UploadPhase::Syncing:
+    display.print(SCREEN_UPLOAD_TIME);
+    break;
+  case UploadPhase::Sending:
+    display.print(SCREEN_UPLOAD_SEND);
+    display.print(uploadSent);
+    display.print('/');
+    display.print(uploadSent + eventCount());
+    break;
+  case UploadPhase::Restoring:
+    display.print(SCREEN_UPLOAD_BACK);
+    break;
+  case UploadPhase::Failed:
+    display.print(uploadFailReason);
+    break;
+  default:
+    display.print(SCREEN_UPLOAD_SENT);
+    display.print(uploadSent);
+    break;
+  }
+
+  display.display();
+}
 
 // Every call below writes into a pixel buffer in the ESP32's own RAM. Nothing
 // reaches the panel until display() pushes that buffer out over I2C, so that is
@@ -70,6 +125,30 @@ static void showStatusScreen(uint8_t stations) {
 void updateStatusScreen() {
   // No buffer to draw into. The rover drives perfectly well without a screen.
   if (!displayReady) {
+    return;
+  }
+
+  // The upload owns the panel for as long as it has something to report, and
+  // its result stays up afterwards rather than being replaced the moment the
+  // network comes back - the operator has to be able to read it.
+  const bool uploadOwnsScreen = uploadPhase != UploadPhase::Idle;
+
+  if (uploadOwnsScreen) {
+    const uint8_t detail = (uploadPhase == UploadPhase::Waiting)
+                               ? uploadSecondsLeft()
+                               : uploadSent;
+
+    if (uploadPhase == lastDrawnPhase && detail == lastDrawnDetail) {
+      return;
+    }
+
+    lastDrawnPhase = uploadPhase;
+    lastDrawnDetail = detail;
+
+    // Forces the status screen to redraw once the upload releases the panel.
+    lastDrawnStations = DISPLAY_STATIONS_UNKNOWN;
+
+    showUploadScreen();
     return;
   }
 

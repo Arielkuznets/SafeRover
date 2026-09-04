@@ -4,6 +4,7 @@
 #include <WiFi.h>
 
 #include "aeb.h"
+#include "cloud.h"
 #include "config.h"
 #include "display.h"
 #include "lka.h"
@@ -107,6 +108,37 @@ static void handleData() {
   json += aebStageName(aebStage);
   json += "\",\"aebPeak\":\"";
   json += aebStageName(aebPeakStage);
+  json += "\"";
+
+  // The brake log, oldest first. Ages rather than dates, because the rover has
+  // no clock until an upload resolves one - the page turns them into "so long
+  // ago" and the absolute time is only ever produced at Adafruit's end.
+  json += ",\"events\":[";
+
+  for (uint8_t i = 0; i < eventCount(); i++) {
+    const BrakeEvent &event = eventAt(i);
+
+    if (i > 0) {
+      json += ',';
+    }
+
+    json += "{\"age\":";
+    json += (millis() - event.atMs);
+    json += ",\"cm\":";
+    json += (event.distanceCm == 0.0f) ? String("null")
+                                       : String(event.distanceCm, 1);
+    json += '}';
+  }
+
+  json += "],\"dropped\":";
+  json += eventsDropped();
+
+  json += ",\"upload\":\"";
+  json += uploadPhaseName(uploadPhase);
+  json += "\",\"uploadSent\":";
+  json += uploadSent;
+  json += ",\"uploadReason\":\"";
+  json += uploadFailReason;
   json += "\"";
 
   // The one place a handler clears state rather than only reporting it. Reset
@@ -278,6 +310,33 @@ static void handleCalibrate() {
   server.send(200, "text/plain", "ok");
 }
 
+// Starts an upload. Records intent and answers immediately - the loop takes the
+// access point down a moment later, so this reply has to be on its way out
+// before the network carrying it disappears.
+//
+// STANDBY only, the same guard and the same reason as the calibration: this
+// drops the network the operator is driving over, and it must not be reachable
+// from a moving rover.
+static void handleUpload() {
+  if (mode != Mode::Standby) {
+    server.send(409, "text/plain", "standby only");
+    return;
+  }
+
+  if (uploadRunning()) {
+    server.send(409, "text/plain", "already running");
+    return;
+  }
+
+  if (eventCount() == 0) {
+    server.send(409, "text/plain", "nothing to send");
+    return;
+  }
+
+  requestUpload();
+  server.send(200, "text/plain", "ok");
+}
+
 // Wrapped rather than exposing the server object, so the loop schedules the
 // module instead of reaching inside it.
 void handleWebClient() { server.handleClient(); }
@@ -293,5 +352,6 @@ void startWebServer() {
   server.on("/drive", HTTP_POST, handleDrive);
   server.on("/tune", HTTP_POST, handleTune);
   server.on("/calibrate", HTTP_POST, handleCalibrate);
+  server.on("/upload", HTTP_POST, handleUpload);
   server.begin();
 }

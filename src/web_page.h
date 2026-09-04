@@ -126,7 +126,17 @@ button.act{font-family:inherit;font-size:.95rem;padding:.55rem 1.1rem;
            border-radius:.4rem;border:1px solid var(--line);
            background:var(--panel2);color:var(--text)}
 button.act:disabled{opacity:.35}
-#ts,#cs{font-size:.8rem;color:var(--dim);align-self:center}
+#ts,#cs,#us{font-size:.8rem;color:var(--dim);align-self:center}
+
+/* The log scrolls inside itself. Sixteen entries would otherwise push the
+   controls under it off the reach of a thumb. */
+.log{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+     gap:.3rem;font-size:.9rem;max-height:10rem;overflow-y:auto}
+.log li{display:grid;grid-template-columns:1fr auto;gap:.75rem;
+        font-family:var(--mono);font-variant-numeric:tabular-nums}
+.log li .t{color:var(--dim)}
+.log li.empty{display:block;color:var(--dim);font-family:inherit}
+#drop{margin:.6rem 0 0;font-size:.78rem;color:var(--warn)}
 
 /* Dimmed rather than removed: the control still exists and still applies the
    moment the rover is back in a mode that uses it. */
@@ -197,6 +207,16 @@ details[open] summary{margin-bottom:.7rem}
 </div>
 
 <div class="card">
+  <h2>brake log</h2>
+  <ol id="log" class="log"><li class="empty">no events yet</li></ol>
+  <p id="drop"></p>
+  <div class="tune" style="margin-top:.8rem">
+    <button class="act" id="up">upload</button>
+    <span id="us">standby only</span>
+  </div>
+</div>
+
+<div class="card">
   <details>
     <summary>diagnostics</summary>
     <div class="rows">
@@ -212,6 +232,19 @@ details[open] summary{margin-bottom:.7rem}
 
 <script>
 const $ = (id) => document.getElementById(id);
+
+// The rover has no clock while it drives, so it reports how long ago each event
+// happened and the page turns that into words. The absolute time is only ever
+// worked out at upload, from one NTP answer.
+function ago(ms) {
+  const s = Math.round(ms / 1000);
+
+  if (s < 60) {
+    return s + 's ago';
+  }
+
+  return Math.floor(s / 60) + 'm ' + (s % 60) + 's ago';
+}
 let tuningLoaded = false;
 
 // What the pad does depends on the mode, and the operator has to know that
@@ -291,6 +324,53 @@ async function poll() {
 
     $('cal').disabled = (s.mode !== 'STANDBY');
 
+    // Newest first, which is the opposite of how the rover holds them: it
+    // sends oldest first, but the entry worth reading is the one that just
+    // happened.
+    const log = $('log');
+    log.textContent = '';
+
+    if (!s.events.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'no events yet';
+      log.append(li);
+    } else {
+      s.events.slice().reverse().forEach((e) => {
+        const li = document.createElement('li');
+        const d = document.createElement('span');
+
+        // null and zero are different answers again: the rover braked without
+        // a reading, which is worth showing as itself rather than as 0.0 cm.
+        d.textContent = e.cm === null ? 'no echo' : e.cm.toFixed(1) + ' cm';
+
+        const t = document.createElement('span');
+        t.className = 't';
+        t.textContent = ago(e.age);
+
+        li.append(d, t);
+        log.append(li);
+      });
+    }
+
+    $('drop').textContent =
+      s.dropped > 0 ? s.dropped + ' older events were overwritten' : '';
+
+    // Busy means the rover is off its own network and this page is about to
+    // stop being answered at all - the state is shown for the poll that still
+    // gets through.
+    const busy = ['waiting', 'syncing', 'sending', 'restoring']
+                   .indexOf(s.upload) !== -1;
+
+    $('up').disabled = busy || s.mode !== 'STANDBY' || s.events.length === 0;
+
+    $('us').textContent =
+      s.upload === 'failed' ? 'failed: ' + s.uploadReason :
+      s.upload === 'done'   ? 'sent ' + s.uploadSent :
+      busy                  ? s.upload + '...' :
+      s.mode !== 'STANDBY'  ? 'standby only' :
+      s.events.length === 0 ? 'nothing to send' : 'ready';
+
     // Filled from the rover once, then left alone. Writing them on every poll
     // would overwrite whatever is being typed, twice a second.
     if (!tuningLoaded) {
@@ -333,6 +413,21 @@ $('cal').addEventListener('click', async () => {
     $('cs').textContent = res.ok ? 'measuring...' : 'standby only';
   } catch (e) {
     $('cs').textContent = 'no reply';
+  }
+});
+
+
+// Starts an upload. The rover answers before it drops its own network, so this
+// reply arrives and then the page goes quiet - which is expected, and why the
+// message says to watch the screen on the vehicle instead.
+$('up').addEventListener('click', async () => {
+  try {
+    const res = await fetch('/upload', { method: 'POST' });
+    $('us').textContent = res.ok
+      ? 'turn the hotspot on now - watch the screen'
+      : 'refused';
+  } catch (e) {
+    $('us').textContent = 'no reply';
   }
 });
 

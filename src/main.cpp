@@ -8,6 +8,7 @@
 #include <Arduino.h>
 
 #include "aeb.h"
+#include "cloud.h"
 #include "config.h"
 #include "display.h"
 #include "lka.h"
@@ -61,7 +62,16 @@ void loop() {
   }
 
   // The button is the mode selector's input, so it is read where the mode is.
-  updateModeButton(now);
+  // Ignored across an upload: the access point is down, the rover is parked,
+  // and every phase of an upload is bounded in time, so there is nothing to
+  // escape from and nothing to change mode for.
+  //
+  // uploadBusy() rather than uploadRunning(), because the request is answered a
+  // moment before the work starts. Without it a press inside that grace could
+  // leave STANDBY, and an upload guarded on STANDBY would begin from MANUAL.
+  if (!uploadBusy()) {
+    updateModeButton(now);
+  }
 
   // Data collection only: read and accumulate, no thresholds and no decisions.
   if (now - lastLineRead >= LINE_READ_INTERVAL_MS) {
@@ -127,6 +137,12 @@ void loop() {
     // something new to reconsider it from.
     updateAebStage();
     confirmWarnStage();
+
+    // Inside the read block for the same reason the two above are: aebStage
+    // can only change here, so an observer running at this cadence cannot miss
+    // a transition. Running it in the loop body would let a stop that came and
+    // went between two checks vanish from the log.
+    updateCloud();
   }
 
   // Advances a phase and nothing else: it writes no command and moves no wheel.
@@ -191,6 +207,20 @@ void loop() {
   }
 
   safeDrive(commandedLeft, commandedRight);
+
+  // The upload steps here rather than beside the web server, because only its
+  // last phase blocks and that phase needs the rover already stopped by the
+  // line above.
+  updateUpload();
+
+  // Raising the access point belongs to the web module, and cloud must not
+  // depend on it - web already reads cloud, and the pair would become a cycle.
+  // The loop is the one place entitled to know about both, the same
+  // arrangement as the calibration's drop to STANDBY.
+  if (uploadNeedsAccessPoint()) {
+    startAccessPoint();
+    finishUpload();
+  }
 
   // The only moment the server does anything at all - it has no task and no
   // timer of its own. That is why a synchronous server was chosen: no request

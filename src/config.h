@@ -49,6 +49,15 @@ constexpr char SCREEN_PHONE_YES[] = "phone: connected";
 constexpr char SCREEN_PHONE_NO[] = "phone: waiting";
 constexpr char SCREEN_AP_FAILED[] = "WIFI AP FAILED";
 
+// The upload panel. Short enough for 20 characters a line, because the numbers
+// they carry are appended to them.
+constexpr char SCREEN_UPLOAD_TITLE[] = "upload";
+constexpr char SCREEN_UPLOAD_WAIT[] = "find wifi ";
+constexpr char SCREEN_UPLOAD_TIME[] = "getting time";
+constexpr char SCREEN_UPLOAD_SEND[] = "sending ";
+constexpr char SCREEN_UPLOAD_BACK[] = "restoring ap";
+constexpr char SCREEN_UPLOAD_SENT[] = "sent ";
+
 constexpr int8_t OLED_RESET_PIN = -1; // this module exposes no reset pin
 
 // --- ADC ---
@@ -291,3 +300,55 @@ static_assert(LKA_KP_MAX <= PWM_MAX_DUTY,
 // generous margin and a calibration that re-measures the white it compares
 // against.
 constexpr uint16_t LKA_OFF_LANE_MARGIN = 900;
+
+// --- Cloud --- How many brake events are held before the oldest is
+// overwritten. Not an arbitrary number: the free Adafruit IO tier allows about
+// 30 data points a minute, so a full queue sent in one go has to stay under
+// that with room to spare.
+//
+// Sixteen events cost 128 bytes. They live in RAM and do not survive a reset -
+// this is a log for one power session, and making it outlast a reboot would
+// mean adding non-volatile storage.
+constexpr uint8_t EVENT_QUEUE_SIZE = 16;
+
+// The grace between answering the upload request and tearing the access point
+// down. The reply has to reach the browser before the network it arrived on
+// disappears underneath it.
+constexpr unsigned long UPLOAD_START_DELAY_MS = 300;
+
+// Long enough to walk to the phone's settings and turn the hotspot on, because
+// that is exactly what this window is for - the network is not expected to
+// exist when the button is pressed.
+constexpr unsigned long UPLOAD_WAIT_MS = 60000;
+
+// How often the association is re-attempted inside that window. The network is
+// expected to be absent when the window opens, so one attempt at the top would
+// only ever find nothing.
+constexpr unsigned long WIFI_RETRY_MS = 5000;
+
+// A ceiling on the NTP answer. Associated to an access point with no route to
+// the internet looks precisely like this: a link that came up and a clock that
+// never moves.
+constexpr unsigned long UPLOAD_SYNC_MS = 15000;
+
+// Per request, and it is a hard ceiling rather than a hint: this call blocks
+// the loop, so the rover is deaf for as long as it takes.
+constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
+
+// How long a finished upload keeps the screen before it goes back to reporting
+// the rover. Long enough to walk back and read it, short enough that it is not
+// still there on the next drive.
+constexpr unsigned long UPLOAD_RESULT_MS = 20000;
+
+// time() answers with something near zero until SNTP replies, so a threshold
+// well past any plausible boot value is what separates a real clock from an
+// unset one. This is 2023-11-14, chosen only because it is safely in the past.
+constexpr time_t NTP_EPOCH_VALID = 1700000000;
+
+// UTC, with no offset applied. Adafruit IO stores timestamps in UTC and renders
+// them in the account's own time zone, so converting here would shift them
+// twice.
+constexpr char NTP_SERVER[] = "pool.ntp.org";
+
+constexpr char AIO_HOST[] = "io.adafruit.com";
+constexpr char AIO_FEED[] = "brake-events";
