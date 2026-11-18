@@ -2,10 +2,10 @@
 
 // The brake log, and the one moment the rover talks to the internet.
 //
-// Nothing here runs while the rover is driving. Events are recorded from the
-// stage the AEB already decided, and the whole network exchange happens once,
-// on request, with the rover standing still - so the radio never competes with
-// the brakes.
+// While the rover drives, this only records: events come from the stage the
+// AEB already decided. The network exchange happens once, on request, and is
+// accepted only in STANDBY with the rover parked - so the upload never
+// competes with the brakes.
 
 #include <Arduino.h>
 

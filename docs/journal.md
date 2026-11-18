@@ -2789,7 +2789,7 @@ drives — only how long ago each event happened. Events are recorded with an up
 one NTP answer at upload time resolves all of them to dates:
 
 ```
-eventEpoch = ntpEpoch - (ntpAtMs - event.atMs)
+eventEpoch = ntpEpoch - (ntpAtMs - event.atMs) / 1000
 ```
 
 This is what keeps `setup()` unchanged and the radio out of the driving loop entirely.

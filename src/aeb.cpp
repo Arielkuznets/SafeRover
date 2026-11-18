@@ -227,8 +227,9 @@ void confirmWarnStage() {
   }
 }
 
-// Its own timer, so the motor frequency can be changed without dragging the
-// brake light along - two LEDC channels on one timer share a frequency.
+// The motor channels join this channel's timer (same frequency and
+// resolution, see config.h), so changing the motor frequency would change
+// the brake light's too.
 void aebBegin() {
   ledcAttachChannel(PIN_BRAKE_LIGHT, PWM_FREQUENCY_HZ, PWM_RESOLUTION_BITS,
                     PWM_CHANNEL_BRAKE);
