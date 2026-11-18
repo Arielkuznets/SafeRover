@@ -6,14 +6,14 @@ A small autonomous rover that demonstrates two active automotive safety systems 
 > ✅ **Status:** Code complete — tag `v1.0-integrated`. **Both safety systems run
 > on the floor — the rover keeps its own lane and brakes for obstacles on its own.**
 > LKA steers from the *difference* between two infrared sensors, so it never has to
-> recognise black at all, and it holds a 25 cm lane. AEB runs in three escalating
+> recognise black to steer, and it holds a 25 cm lane. AEB runs in three escalating
 > stages with hysteresis, and it cannot be bypassed — hold the forward button at a
 > wall from the phone and the rover refuses, while reverse and pivot turns stay free
 > so it can always back out of what it stopped for. A state machine ties the three
 > modes together, the phone drives the rover over its own Wi-Fi with a watchdog that
-> stops it when commands stop arriving, and every braking event is logged to the
-> cloud with a timestamp. What remains is phase 9 — the enclosure, the portfolio and
-> the demonstration dry run. See the [roadmap](#roadmap).
+> stops it when commands stop arriving, and every emergency stop is logged and
+> uploaded to the cloud on request, with a timestamp. What remains is phase 9 — the
+> enclosure, the portfolio and the demonstration dry run. See the [roadmap](#roadmap).
 
 SafeRover runs two independent closed control loops (sense → decide → act) on top of a
 real-time state machine.
@@ -66,18 +66,18 @@ SafeRover drives on a small track and runs in three modes:
 - **Manual** — driven from a phone over Wi-Fi (a dashboard the ESP32 serves).
 - **Autonomous** — drives itself, staying inside a marked lane and correcting its own steering.
 
-Two safety layers run on top of *every* mode:
+Two safety layers run on top of the modes — AEB in *every* mode, LKA in Autonomous:
 
 ### 🛑 AEB — Autonomous Emergency Braking
 
-A front ultrasonic sensor measures distance ten times a second and escalates through
+A front ultrasonic sensor measures distance up to twenty times a second and escalates through
 three stages, like a real car:
 
 | Stage | At | What happens |
 |-------|---:|--------------|
 | `WARN` | 90 cm | buzzer only — the speed is untouched |
-| `SLOW` | 55 cm | forced ceiling on speed, buzzer and brake lights |
-| `STOP` | 35 cm | the motors are shorted through the bridge and held, buzzer and brake lights |
+| `SLOW` | 55 cm | forced ceiling on speed, buzzer and brake light |
+| `STOP` | 35 cm | the motors are shorted through the bridge and held, buzzer and brake light |
 
 **This layer overrides every command, including manual driving.** Hold the forward
 button at a wall and the rover simply refuses. Braking is active rather than coasting,
@@ -93,7 +93,7 @@ Two decisions in it are worth more than the thresholds:
   obstacle ahead only matters while the rover drives at it. A rover pinned against a
   wall with the only commands that would free it refused is a worse failure than the
   one being prevented.
-- **A missing echo is never read as clear road.** It is not a distance at all, and what
+- **A missing echo is never read as clear road on its own.** It is not a distance at all, and what
   it means depends on the last real reading: lost at three metres is open space, lost
   at fifteen centimetres is something close, possibly inside the sensor's blind zone.
   The thresholds themselves were raised after the first runs on the floor — the
@@ -113,7 +113,7 @@ while their difference shifted by **154**. A fixed brightness threshold calibrat
 room lands on black in the other. A difference does not.
 
 A button-triggered calibration measures the resting difference while the rover sits still
-on white and stores it as the zero point, which means **the system never has to see black
+on white and stores it as the zero point, which means **the calibration never has to see black
 at all**. A **proportional (P) controller** turns the deviation from that zero into a duty
 difference between the two sides — the rover turns toward its slower side — and a deadband
 holds it straight while neither sensor has reached a stripe.
@@ -124,9 +124,9 @@ recover, too much and it is thrown onto the opposite stripe. The first track was
 did exactly that.
 
 Around the two safety systems: an on-board **OLED** status display, a **phone dashboard**
-with live telemetry and a brake-event log, a physical **mode button**, and every braking
-event pushed to the **cloud** (Adafruit IO) with an **NTP** timestamp — building a
-remotely-viewable history.
+with live telemetry and a brake-event log, a physical **mode button**, and every emergency
+stop uploaded to the **cloud** (Adafruit IO) on request, with an **NTP** timestamp — building
+a remotely-viewable history.
 
 ### 📱 Phone control — and a watchdog that does not trust silence
 
@@ -140,10 +140,10 @@ is an unsafe state — one brakes while the other accelerates — and refusing t
 association keeps that out of the command code entirely.
 
 The browser does not send *events*, it **repeats the current intent** several times a
-second. A lost message costs nothing, because the next one carries the same thing. And the
-rover measures the gap between them:
+second. In manual driving a lost message costs nothing, because the next one carries the
+same thing. And the rover measures the gap between them:
 
-> **If no command arrives for half a second, the rover stops itself.**
+> **In manual mode, if no command arrives for half a second, the rover stops itself.**
 
 That matters because nothing in the system decays on its own. The commanded values hold
 whatever arrived last, and the PWM peripheral keeps producing that waveform with no help
@@ -156,7 +156,7 @@ watchdog exists for the case where "stop" cannot be sent at all.
 ### ☁️ The brake log — and a rover that keeps a stopwatch, not a clock
 
 Every time the braking layer enters its **Stop** stage, the rover writes down the
-distance that caused it. At the end of a run one button on the dashboard sends the
+distance that caused it — or zero, when the stop came from a lost echo. At the end of a run one button on the dashboard sends the
 whole log to **Adafruit IO**, each entry carrying a real date and time.
 
 The interesting part is where the time comes from. **The rover has no clock while it
@@ -166,14 +166,15 @@ happened:
 ```
 while driving   event.atMs = millis()            an uptime, not a date
 at upload       ntpEpoch   = time(nullptr)       the wall clock, fetched once
-                eventEpoch = ntpEpoch - (now - event.atMs)
+                ntpAtMs    = millis()            the uptime it arrived at
+                eventEpoch = ntpEpoch - (ntpAtMs - event.atMs) / 1000
 ```
 
 One answer from an NTP server resolves every queued event at once. Nothing about the
-network is needed while the rover is moving, which is the whole point:
+internet is needed while the rover is moving, which is the whole point:
 
-> **The radio never competes with the brakes — not because a condition says so, but
-> because they never run at the same time.**
+> **The upload never competes with the brakes — it is accepted only in Standby, with the
+> rover parked.**
 
 Uploading takes the access point down first. One radio cannot serve a network and join
 another on a different channel, so the two are kept apart in time rather than fought
@@ -181,8 +182,10 @@ over. While the access point is down the dashboard is unreachable by design — 
 what the small screen on the vehicle is for, and the only moment in the project where
 it is the only channel available.
 
-An event leaves the queue **only** once the server confirms it. A failed upload keeps
-everything it had and can simply be retried.
+An event leaves the queue once the server confirms it — or when a new stop finds all
+sixteen places full and overwrites the oldest, which the dashboard counts. The queue is
+held in RAM, so a reset empties it. A failed upload keeps everything not yet confirmed
+and can simply be retried.
 
 ---
 
@@ -196,22 +199,22 @@ everything it had and can simply be retried.
 | Distance | HC-SR04 ultrasonic |
 | Lane sensing | 2× TCRT5000 IR |
 | Display | 0.91" I²C OLED — SSD1306, 128×32, at `0x3C` |
-| Indicators | brake LEDs, buzzer, status LED |
+| Indicators | brake LED, buzzer, status LED |
 | Input | physical mode button |
 
 **Steering — differential, no servo.** Turning is a *speed difference* between the two
 sides: the rover turns toward the slower side. The two motors on each side are wired in
 parallel into a single L298N channel — the driver has only two channels, and motors on
 the same side always turn the same way at the same speed, so they need no separate
-control. 4WD changes the wiring, not the code: `drive(left, right)` is unchanged.
+control. 4WD changes the wiring, not the code: `drive()` still takes one value per side.
 
 Because the chassis is 4WD with no caster, all four wheels scrub sideways through a
 turn. This was expected to make tuning `Kp` slow and twitchy. It was not what held the
 tuning up: the lane being narrower than a single correction was, and widening the track
 fixed what no value of `Kp` could.
 
-**Power.** Motors run from a 6×AA pack (~9 V); the ESP32 runs from a separate 5 V power
-bank; the two supplies share a common ground. Separating them prevents brownout resets
+**Power.** Motors run from a 6×AA pack (~9 V); the ESP32 runs from a separate 18650 cell in
+a battery shield, by USB cable into its own USB-C; the two supplies share a common ground. Separating them prevents brownout resets
 when the motors spike current. The chassis's own 4×AA holder is not used.
 
 **The display.** Confirmed in phase 2: a 128×32 SSD1306 answering at `0x3C`, found with
@@ -222,7 +225,7 @@ while the module was squeezed by hand. A replacement of the same part works with
 firmware unchanged, which is what confirmed the fault was physical rather than software.
 
 <details>
-<summary><b>Planned pin map (wiring contract)</b></summary>
+<summary><b>Pin map (wiring contract)</b></summary>
 
 | Component | Signal | ESP32 pin | Notes |
 |-----------|--------|-----------|-------|
@@ -232,20 +235,23 @@ firmware unchanged, which is what confirmed the fault was physical rather than s
 | Line sensor L / R | AO / AO | 34 / 35 | analog, ADC1, input-only pins |
 | OLED | SDA / SCL | 21 / 22 | I²C — confirm address with a scanner |
 | Buzzer | I/O | 4 | active-low module — driven **high** to stay silent |
-| Brake LEDs | anode | 19 | via 220 Ω each |
+| Brake LED | anode | 19 | via 220 Ω |
 | Status LED | anode | 13 | via 220 Ω |
 | Mode button | — | 23 | `INPUT_PULLUP` (pressed = LOW) |
 
-Pins avoid the ESP32 boot-strapping pins and ADC2 (disabled when Wi-Fi is on), so the
-analog line sensors sit on ADC1. They are also limited to the lines this 30-pin board
-actually breaks out — the chip has more GPIO than the headers expose, and GPIO 16/17
-are not among them.
+Pins avoid the ESP32 boot-strapping pins except GPIO 5 (TRIG), whose strap only sets
+SDIO-slave timing, which booting from flash does not use. The analog line sensors avoid
+ADC2 (disabled when Wi-Fi is on) by sitting on ADC1. Pins are also limited to the lines
+this 30-pin board actually breaks out — the chip has more GPIO than the headers expose —
+and GPIO 16/17 (RX2/TX2) and 36/39 (VP/VN) are among them and still free.
 
-**PWM channel allocation.** The ESP32's eight LEDC channels share four timers in pairs
-(0-1, 2-3, 4-5, 6-7), and the frequency is a property of the timer rather than the
-channel — two channels on one timer cannot run at different frequencies. Channels are
-therefore assigned so that nothing shares a timer: **0** for the brake light, **2** for
-ENA (left side) and **4** for ENB (right side).
+**PWM channel allocation.** The frequency is a property of the LEDC timer rather than the
+channel — two channels on one timer cannot run at different frequencies. In the
+Arduino-ESP32 core used here (3.3.9) the channel number does not choose the timer: a new
+channel reuses a timer already running at the same frequency and resolution, and takes a
+free one only otherwise. **0** for the brake light, **2** for ENA (left side) and **4** for
+ENB (right side) all run at 5 kHz with 8-bit duty, so the three share one timer — harmless
+while their frequencies match.
 
 </details>
 
@@ -259,23 +265,24 @@ ENA (left side) and **4** for ENB (right side).
                  [ ESP32 ]
    AEB safety layer · state machine · LKA · web server
         /         |          \              \
- [L298N + motors] [OLED]  [brake lights+buzzer]  [cloud: NTP + event log]
+ [L298N + motors] [OLED]  [brake light+buzzer]   [cloud: NTP + event log]
 ```
 
-The firmware is split into modules, each built and tested in isolation:
+The firmware is split into modules, one responsibility each:
 
 | Module | Responsibility |
 |--------|----------------|
-| `sensors` | distance (median-filtered), calibrated line reads |
-| `motors` | drive / turn / speed (PWM), differential steering, trim |
+| `sensors` | distance (median-filtered), averaged line reads |
+| `motors` | drive / turn / speed (PWM), differential steering |
 | `aeb` | WARN / SLOW / STOP stages + hysteresis |
 | `lka` | P-controller steering correction |
-| `state_machine` | modes + priority (safety overrides everything) |
+| `modes` | STANDBY / MANUAL / AUTO, and which source may drive |
 | `web` + `display` | phone dashboard, commands, OLED |
 | `cloud` | NTP time + Adafruit IO events |
 
 **Design rule:** all driving goes through the safety layer — navigation and manual control
-call `safeDrive(...)`, never the motors directly, so AEB is impossible to bypass.
+only record what they want, and the loop passes it to `safeDrive(...)`, never to the motors
+directly, so AEB is impossible to bypass.
 
 `safeDrive()` was built in phase 4 as an empty seam, before it had any callers, and the
 AEB moved into it in phase 5. That is the payoff: **not one line of the code that decides
@@ -286,7 +293,7 @@ silent way around the brakes that no test would catch.
 Phase 6 collected the same debt from the other side. The lane keeping writes to the same
 two variables a phone command writes to, so it arrived without touching the braking layer
 at all — `updateLka()` never calls `drive()` or `safeDrive()`, it records an intention and
-lets the loop apply it. **The AEB can still slow or stop anything the lane keeping
+lets the loop apply it. **The AEB still has the last word on anything the lane keeping
 decides**, and that ordering is not a courtesy: it is the only route to the motors there
 is.
 
@@ -294,10 +301,10 @@ is.
 
 ## Tech stack
 
-- **C++ (Arduino framework)** on the ESP32 — real-time control with a non-blocking
-  `millis()` scheduler (no `delay()` in the main loop).
-- **[pioarduino](https://github.com/pioarduino/platform-espressif32)** — a community
-  PlatformIO fork that tracks the current ESP32 Arduino core.
+- **C++ (Arduino framework)** on the ESP32 — real-time control with a `millis()`
+  scheduler, so no `delay()` sets the pace of the main loop.
+- **[pioarduino](https://github.com/pioarduino/platform-espressif32)** — a community fork
+  of PlatformIO's ESP32 platform that tracks the current ESP32 Arduino core.
 - Built in **Antigravity** (VS Code-based) with **clangd** IntelliSense.
 
 ---
@@ -310,11 +317,12 @@ IDE extension). From the project root:
 ```bash
 pio run               # compile
 pio run -t upload     # flash to the board
-pio device monitor    # serial monitor @ 115200 baud
+pio device monitor    # serial monitor @ 115200 baud (for the I²C scanner; the rover firmware prints nothing)
 ```
 
-The platform, board and library versions are pinned in
-[`platformio.ini`](platformio.ini).
+The platform, board and libraries are set in [`platformio.ini`](platformio.ini); the
+platform follows pioarduino's `stable` release and the libraries accept compatible
+updates (`^`), so their versions are not pinned.
 
 The rover serves its own Wi-Fi access point, and its passphrase is deliberately not
 in this repository — this repo is public. Create `src/secrets.h` before the first
@@ -334,9 +342,9 @@ constexpr char AIO_USERNAME[] = "your-adafruit-username";
 constexpr char AIO_KEY[] = "your-aio-key";
 ```
 
-Uploading also needs a feed named `brake-events` on that account. Without the four
-station and Adafruit values the firmware still builds and drives — only the upload
-fails, and it reports why on the vehicle's screen.
+Uploading also needs a feed named `brake-events` on that account. With placeholder values
+for the four station and Adafruit constants the firmware still builds and drives — only the
+upload fails, and it reports why on the vehicle's screen.
 
 The network name is `Saferover`, and it is in the source: an SSID is broadcast over
 the air anyway, so hiding it would protect nothing and only make the network harder
@@ -359,7 +367,7 @@ pio run -e i2c-scanner -t upload
 | 0 | Environment — toolchain + Blink compiles | ✅ |
 | 1 | GPIO basics — Serial, button, LED, PWM | ✅ |
 | 2 | Sensors on the bench — OLED, ultrasonic, line sensors | ✅ |
-| 3 | Vehicle moves — chassis, power, straight-line trim | ✅ |
+| 3 | Vehicle moves — chassis, power, motor directions | ✅ |
 | 4 | Phone control — Wi-Fi dashboard + watchdog stop | ✅ |
 | 5 | AEB — 3-stage braking + hysteresis | ✅ |
 | 6 | LKA — track + P-controller tuning | ✅ |
@@ -369,7 +377,7 @@ pio run -e i2c-scanner -t upload
 
 ### Progress photos
 
-[`photos/`](photos/) holds a shot of the build at each stage — the breadboard as it grew,
+[`photos/`](photos/) holds a shot of the build at each stage up to phase 3 — the breadboard as it grew,
 the serial output captured while the line sensors were being calibrated, and the chassis
 coming together.
 
