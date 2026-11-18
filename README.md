@@ -17,6 +17,44 @@ A small autonomous rover that demonstrates two active automotive safety systems 
 SafeRover runs two independent closed control loops (sense → decide → act) on top of a
 real-time state machine.
 
+## 🧊 Explore it in 3D
+
+<p align="center">
+  <a href="https://arielkuznets.github.io/SafeRover/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/3d-model/hero-dark.webp">
+      <img src="docs/3d-model/hero-light.webp" width="900" alt="The interactive 3D model of SafeRover: the rover on its lane with its main parts labelled, and the Model tab open beside it">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://arielkuznets.github.io/SafeRover/"><img src="https://img.shields.io/badge/Open_the_interactive_3D_model-2457d6?style=for-the-badge&logo=threedotjs&logoColor=white" alt="Open the interactive 3D model"></a>
+</p>
+
+The rover as it is built — every part, every wire and both safety systems — in a page that
+runs in the browser, on a computer or a phone. Nothing to install.
+
+<table>
+  <tr>
+    <th width="33%">🔧 Model</th>
+    <th width="33%">🔌 Wiring</th>
+    <th width="33%">▶️ Simulations</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://arielkuznets.github.io/SafeRover/#model"><img src="docs/3d-model/tab-model.webp" width="240" alt="The Model tab with the HC-SR04 selected: its role, its pins and the expansion-board pin each wire lands on"></a></td>
+    <td align="center"><a href="https://arielkuznets.github.io/SafeRover/#wiring"><img src="docs/3d-model/tab-wiring.webp" width="240" alt="The Wiring tab: all 42 wires on the rover, coloured by signal, with the list grouped by part"></a></td>
+    <td align="center"><a href="https://arielkuznets.github.io/SafeRover/#simaeb-step56"><img src="docs/3d-model/tab-simulations.webp" width="240" alt="The AEB simulation at the moment it enters STOP: the distance read, the code that decided, and the outputs"></a></td>
+  </tr>
+  <tr>
+    <td>Turn the rover, take it apart, and click any part to see what it does and which pins it uses.</td>
+    <td>All 42 wires — 31 jumpers from the ESP32 expansion board, 8 motor leads, 2 battery leads and the USB cable — each along its route.</td>
+    <td>Watch the AEB and LKA logic of the firmware decide one sensor reading at a time: what was read, which lines of code ran, and what reached the motors.</td>
+  </tr>
+</table>
+
+<sub>Part positions are measured from a video of the finished rover; anything that could not be measured is marked as an estimate in the model. The simulations run the firmware's decision logic on modelled sensor readings and motion.</sub>
+
 ---
 
 ## What it does
