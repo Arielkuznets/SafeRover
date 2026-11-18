@@ -372,12 +372,8 @@ pio run -e i2c-scanner -t upload
 the serial output captured while the line sensors were being calibrated, and the chassis
 coming together.
 
-![The finished rover: a two-deck acrylic chassis on four wheels, with the ultrasonic sensor and both line sensor boards at the front, the breadboards and ESP32 across the two decks, and the battery pack at the back](photos/phase3-fully-wired-vehicle.jpg)
-
 A build log with the measurements and the faults hit along the way is in
 [`docs/journal.md`](docs/journal.md).
-
-_A demo video will follow._
 
 ---
 
