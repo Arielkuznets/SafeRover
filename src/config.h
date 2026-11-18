@@ -70,13 +70,15 @@ constexpr uint16_t ADC_MAX_VALUE = (1U << ADC_RESOLUTION_BITS) - 1;
 // counts.
 constexpr uint8_t LINE_SENSOR_SAMPLES = 16;
 
-// --- PWM (LEDC) --- The eight channels share four timers in pairs, and the
-// frequency belongs to the timer: two channels on one timer cannot run at
-// different frequencies, and setting one silently changes the other. These
-// three sit on separate timers.
-constexpr uint8_t PWM_CHANNEL_BRAKE = 0;       // timer 0
-constexpr uint8_t PWM_CHANNEL_MOTOR_LEFT = 2;  // timer 1, ENA
-constexpr uint8_t PWM_CHANNEL_MOTOR_RIGHT = 4; // timer 2, ENB
+// --- PWM (LEDC) --- The frequency belongs to the timer, not the channel: two
+// channels on one timer cannot run at different frequencies, and setting one
+// silently changes the other. On this core (3.3.9) the channel number does
+// not pick the timer - a channel reuses any timer already running at the same
+// frequency and resolution - so these three share one timer, which is
+// harmless while all three run at PWM_FREQUENCY_HZ.
+constexpr uint8_t PWM_CHANNEL_BRAKE = 0;
+constexpr uint8_t PWM_CHANNEL_MOTOR_LEFT = 2;  // ENA
+constexpr uint8_t PWM_CHANNEL_MOTOR_RIGHT = 4; // ENB
 
 constexpr uint32_t PWM_FREQUENCY_HZ = 5000; // above what the eye follows
 constexpr uint8_t PWM_RESOLUTION_BITS = 8;  // 256 steps

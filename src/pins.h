@@ -5,8 +5,9 @@
 
 #include <Arduino.h>
 
-// GPIO 16 and 17 are not broken out on this 30-pin board, which is why the
-// brake light is on 19 and the status LED on 13 rather than the datasheet pins.
+// 19 and 13 were chosen when GPIO 16 and 17 were believed missing from this
+// 30-pin board. They are on the header, labelled RX2 and TX2, and the choice
+// stands: both are plain output pins.
 constexpr uint8_t PIN_BRAKE_LIGHT = 19;
 constexpr uint8_t PIN_STATUS_LED = 13;
 constexpr uint8_t PIN_MODE_BUTTON = 23;
