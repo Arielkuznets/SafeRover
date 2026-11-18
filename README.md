@@ -3,16 +3,17 @@
 A small autonomous rover that demonstrates two active automotive safety systems —
 **Autonomous Emergency Braking (AEB)** and **Lane Keeping Assist (LKA)** — on an ESP32.
 
-> 🚧 **Status:** In active development. **Both safety systems now run on the floor —
-> the rover keeps its own lane and brakes for obstacles on its own.**
+> ✅ **Status:** Code complete — tag `v1.0-integrated`. **Both safety systems run
+> on the floor — the rover keeps its own lane and brakes for obstacles on its own.**
 > LKA steers from the *difference* between two infrared sensors, so it never has to
 > recognise black at all, and it holds a 25 cm lane. AEB runs in three escalating
 > stages with hysteresis, and it cannot be bypassed — hold the forward button at a
 > wall from the phone and the rover refuses, while reverse and pivot turns stay free
-> so it can always back out of what it stopped for. Before those: driving from a phone
-> over the rover's own Wi-Fi with a watchdog that stops it when commands stop
-> arriving, and every component wired and calibrated on the vehicle. Next is the state
-> machine that ties the modes together. See the [roadmap](#roadmap).
+> so it can always back out of what it stopped for. A state machine ties the three
+> modes together, the phone drives the rover over its own Wi-Fi with a watchdog that
+> stops it when commands stop arriving, and every braking event is logged to the
+> cloud with a timestamp. What remains is phase 9 — the enclosure, the portfolio and
+> the demonstration dry run. See the [roadmap](#roadmap).
 
 SafeRover runs two independent closed control loops (sense → decide → act) on top of a
 real-time state machine.
